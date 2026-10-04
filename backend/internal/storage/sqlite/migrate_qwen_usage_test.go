@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// TestMigration0171DownPreservesKimiUsage catches rolling back Qwen by
+// TestMigration0175DownPreservesKimiUsage catches rolling back Qwen by
 // deleting sibling-provider usage owned by an earlier migration.
-func TestMigration0171DownPreservesKimiUsage(t *testing.T) {
-	db := openMigratedDatabaseCopy(t, 170)
-	upTo(t, db, 171)
+func TestMigration0175DownPreservesKimiUsage(t *testing.T) {
+	db := openMigratedDatabaseCopy(t, 174)
+	upTo(t, db, 175)
 	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
 	if _, err := db.Exec(`INSERT INTO projects (id, path, display_name, registered_at) VALUES ('usage-migration', '/tmp/usage-migration', 'usage', ?)`, now); err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestMigration0171DownPreservesKimiUsage(t *testing.T) {
 		}
 	}
 
-	downTo(t, db, 170)
+	downTo(t, db, 174)
 	counts := map[string]int{}
 	for _, harness := range harnesses {
 		var count int
