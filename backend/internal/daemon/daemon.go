@@ -53,6 +53,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/agentauth"
 	browsersvc "github.com/aoagents/agent-orchestrator/backend/internal/service/browser"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
+	cuesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/cue"
 	devimportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/devimport"
 	fsbrowsersvc "github.com/aoagents/agent-orchestrator/backend/internal/service/fsbrowser"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/githubpat"
@@ -549,7 +550,7 @@ func Run() error {
 	agentSvc = agentsvc.NewWithDeps(agentDeps)
 	agentSvc.WarmModelCatalogs(ctx)
 
-	sessionSvc, reviewSvc, wiredSessMgr, err := startSession(ctx, cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, agents, agentSvc, managedPreview, browserBroker, browserAuthority, chatLauncher{svc: chatSvc}, settingsSvc, policyCoordinator, tracker, codexOperationGate, log)
+	sessionSvc, reviewSvc, wiredSessMgr, err := startSession(ctx, cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, notificationWriter, agents, agentSvc, managedPreview, browserBroker, browserAuthority, chatLauncher{svc: chatSvc}, settingsSvc, policyCoordinator, tracker, codexOperationGate, log)
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -803,15 +804,6 @@ func Run() error {
 	// would silently report offline.
 	presenceTracker := presence.NewTracker()
 
-	// Push dispatcher: an additive notification-hub subscriber that relays each
-	// new notification to every registered device via the Expo Push Service. Runs
-	// for the daemon's lifetime and stops when ctx is cancelled. EXPO_ACCESS_TOKEN
-	// (optional) enables Expo's enforced push security when set.
-	if pushDevices != nil {
-		dispatcher := push.NewDispatcher(notificationHub, pushDevices, push.NewExpoClient(os.Getenv("EXPO_ACCESS_TOKEN")), log)
-		go dispatcher.Run(ctx)
-	}
-
 	// Managed remote-access connector. Reap first: a daemon that died without
 	// stopping its connector leaves a public tunnel to this machine running
 	// with nobody watching it.
@@ -853,6 +845,12 @@ func Run() error {
 	}
 
 	bs.HostID = hostIdentity.HostID
+	// Pushes include the authoritative host identity so a phone can reject
+	// same-numbered sessions on another machine. No identity means no push.
+	if pushDevices != nil && hostIdentity.HostID != "" {
+		dispatcher := push.NewDispatcher(notificationHub, pushDevices, push.NewExpoClient(os.Getenv("EXPO_ACCESS_TOKEN")), hostIdentity.HostID, log)
+		go dispatcher.Run(ctx)
+	}
 	if mobilebridge.KeepAwakeSupported() {
 		bs.KeepAwake = mobilebridge.NewKeepAwake(os.Getpid())
 	}
@@ -880,6 +878,7 @@ func Run() error {
 		Import:             importsvc.New(importsvc.Deps{Store: store}),
 		Directories:        fsbrowsersvc.New(),
 		ShellTerminals:     shellTermSvc,
+		Cues:               cuesvc.New(cuesvc.Deps{Store: store, Sessions: sessionSvc, Terminals: shellTermSvc}),
 		AgentAuth:          agentAuthSvc,
 		GitHub:             githubpat.New(cfg.DataDir),
 		Conversations:      chatSvc,
@@ -898,11 +897,12 @@ func Run() error {
 				return sqlite.OpenReadOnly(ctx, dataDir)
 			},
 		}),
-		Browser:             browserService,
-		LinkPreview:         linkpreviewsvc.New(nil),
-		PreviewServer:       managedPreview,
-		SessionCapabilities: browserAuthority,
-		AgentSwitchPolicy:   policyCoordinator,
+		Browser:                  browserService,
+		LinkPreview:              linkpreviewsvc.New(nil),
+		PreviewServer:            managedPreview,
+		SessionCapabilities:      browserAuthority,
+		ShellPreviewCapabilities: shellTermSvc,
+		AgentSwitchPolicy:        policyCoordinator,
 	})
 	if err != nil {
 		stop()
@@ -932,7 +932,7 @@ func Run() error {
 
 	// Late-bind: the LAN listener shares the exact loopback router instance so
 	// the LAN surface and loopback surface never drift apart.
-	lan := httpd.NewMobileLAN(srv.Handler(), mobilebridge.DefaultPort, log, telemetrySink)
+	lan := httpd.NewMobileLAN(srv.Handler(), hostIdentity.HostID, mobilebridge.DefaultPort, log, telemetrySink)
 	bs.LAN = lan
 
 	// Restore Connect Mobile across a daemon restart: if the bridge was left

@@ -287,7 +287,7 @@ func (c *Collector) reactivateSessionLocked(
 			return err
 		}
 	} else if session.Harness == domain.HarnessPi {
-		if err := c.backfillPiPaths(ctx); err != nil {
+		if err := c.backfillPiPaths(ctx, nil); err != nil {
 			return err
 		}
 	} else {
@@ -584,14 +584,18 @@ func (c *Collector) BackfillActive(ctx context.Context) error {
 		return err
 	}
 	var errs []error
+	piBackfilled := false
 	for _, session := range sessions {
 		if session.IsTerminated || !SupportedHarness(session.Harness) {
 			continue
 		}
 		nativeID := usageNativeSessionID(session)
 		if nativeID == "" && session.Harness == domain.HarnessPi {
-			if err := c.backfillPiPaths(ctx); err != nil {
-				errs = append(errs, err)
+			if !piBackfilled {
+				if err := c.backfillPiPaths(ctx, sessions); err != nil {
+					errs = append(errs, err)
+				}
+				piBackfilled = true
 			}
 			continue
 		}
@@ -620,7 +624,25 @@ func usageNativeSessionID(session domain.SessionRecord) string {
 	return boundedUsageMetadata(nativeID)
 }
 
-func (c *Collector) backfillPiPaths(ctx context.Context) error {
+func (c *Collector) backfillPiPaths(ctx context.Context, sessions []domain.SessionRecord) error {
+	if sessions == nil {
+		var err error
+		sessions, err = c.store.ListAllSessions(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	hasLivePi := false
+	for _, session := range sessions {
+		if session.Harness == domain.HarnessPi && !session.IsTerminated &&
+			session.Activity.State != domain.ActivityExited {
+			hasLivePi = true
+			break
+		}
+	}
+	if !hasLivePi {
+		return nil
+	}
 	paths, err := newestPiPaths(ctx, c.roots.PiSessions, 256)
 	if err != nil {
 		return err
@@ -630,7 +652,7 @@ func (c *Collector) backfillPiPaths(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := c.reconcilePiPath(ctx, path); err != nil {
+		if err := c.reconcilePiPath(ctx, path, sessions); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -738,7 +760,7 @@ func (c *Collector) ReconcileSources(ctx context.Context, limit int64) error {
 	defer c.mu.Unlock()
 
 	var errs []error
-	if err := c.backfillPiPaths(ctx); err != nil {
+	if err := c.backfillPiPaths(ctx, nil); err != nil {
 		errs = append(errs, err)
 	}
 	if limit == 0 {
@@ -764,8 +786,17 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 		return err
 	}
 	defer c.mu.Unlock()
-	if pathWithinRoot(ctx, path, c.roots.PiSessions) {
-		return c.reconcilePiPath(ctx, path)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	piCandidate := false
+	if c.roots.PiSessions != "" && filepath.IsAbs(path) {
+		rel, err := filepath.Rel(filepath.Clean(c.roots.PiSessions), filepath.Clean(path))
+		piCandidate = err == nil && rel != ".." &&
+			!strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	if piCandidate || pathWithinRoot(ctx, path, c.roots.PiSessions) {
+		return c.reconcilePiPath(ctx, path, nil)
 	}
 
 	resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessCodex, path)
@@ -821,18 +852,20 @@ func (c *Collector) ReconcilePath(ctx context.Context, path string) error {
 	return errors.Join(errs...)
 }
 
-func (c *Collector) reconcilePiPath(ctx context.Context, path string) error {
+func (c *Collector) reconcilePiPath(ctx context.Context, path string, sessions []domain.SessionRecord) error {
 	resolved, _, _, err := c.validateSourcePath(ctx, domain.HarnessPi, path)
 	if err != nil {
-		return nil //nolint:nilerr // Watch notifications may target another provider.
+		return err
 	}
 	meta, ok := readPiSessionMeta(ctx, resolved)
 	if !ok {
-		return nil
+		return ctx.Err()
 	}
-	sessions, err := c.store.ListAllSessions(ctx)
-	if err != nil {
-		return err
+	if sessions == nil {
+		sessions, err = c.store.ListAllSessions(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	var match *domain.SessionRecord
 	for _, session := range sessions {

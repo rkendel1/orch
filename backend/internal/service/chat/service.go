@@ -686,7 +686,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			return nil, err
 		}
 	}
-	if !liveReconnect && cfg.Harness == domain.HarnessOpenCode && conversation.Settings.OpenCodeMode != "" {
+	if !liveReconnect && isOpenCodeHarness(cfg.Harness) && conversation.Settings.OpenCodeMode != "" {
 		if err := restoreOpenCodeMode(ctx, conv, conversation.Settings.OpenCodeMode); err != nil {
 			_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
 			return nil, err
@@ -703,6 +703,13 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			_ = cleanupUnpublishedConversation(conv, false)
 			return nil, fmt.Errorf("%w: load live conversation before reconnect: %w", ports.ErrChatRecoveryInconclusive, err)
 		}
+	}
+
+	// Reconcile legacy demands before replacing the owning generation, while
+	// durable successful turns can still prove recovery for that epoch.
+	if _, err := s.store.ReconcileConversationAuthentication(ctx, conversation.ID, "", "", s.now()); err != nil {
+		_ = cleanupUnpublishedConversation(conv, false)
+		return nil, fmt.Errorf("reconcile conversation authentication: %w", err)
 	}
 
 	// Claim the durable fence before the controller starts consuming events. A
@@ -726,6 +733,19 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		} else if err := s.store.ClaimChatControllerGeneration(ctx, cfg.SessionID, generation); err != nil {
 			_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
 			return nil, fmt.Errorf("claim chat controller: %w", err)
+		}
+	}
+	if liveReconnect {
+		// A provider may have accepted a prompt before its ID could be bound.
+		// Its replayed events will be adopted separately; leave bound live work
+		// and queued intake intact while closing the unbound visible spinner.
+		for _, turn := range liveRows.Turns {
+			if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" || turn.RolledBackAt != nil {
+				continue
+			}
+			if err := s.store.SettleUnboundRunningTurn(ctx, conversation.ID, cfg.SessionID, turn.ID, s.now()); err != nil {
+				s.log.Error("chat start: settle unbound running turn", "session", cfg.SessionID, "turn", turn.ID, "error", err)
+			}
 		}
 	}
 	providerBoundary := (*domain.ConversationBranch)(nil)
@@ -1048,6 +1068,10 @@ func (s *Service) Send(
 	msg ports.ChatUserMessage,
 ) (domain.ConversationTurn, error) {
 	record, err := s.requireChatSession(ctx, id)
+	if err != nil {
+		return domain.ConversationTurn{}, err
+	}
+	msg.ClientPayloadHash, err = clientPayloadHash(msg)
 	if err != nil {
 		return domain.ConversationTurn{}, err
 	}
@@ -1870,7 +1894,7 @@ func (s *Service) SetConfigOption(
 			settings.ReasoningEffort = ""
 		}
 	}
-	if record.Harness == domain.HarnessOpenCode && configID == "mode" {
+	if isOpenCodeHarness(record.Harness) && configID == "mode" {
 		for _, option := range options {
 			if option.ID == "mode" {
 				settings.OpenCodeMode = option.Current.Select
@@ -1887,6 +1911,10 @@ func (s *Service) SetConfigOption(
 		s.persistPickedModel(id, previous, settings)
 	}
 	return options, nil
+}
+
+func isOpenCodeHarness(harness domain.AgentHarness) bool {
+	return harness == domain.HarnessOpenCode || harness == domain.HarnessOpenCodeV2
 }
 
 // Restore the provider-owned choice before publishing a controller. A rejected
@@ -2126,7 +2154,7 @@ func permissionConfigOptions(harness domain.AgentHarness, options []ports.ChatCo
 				case "bypassPermissions":
 					choice.PermissionMode = domain.PermissionModeBypassPermissions
 				}
-			case domain.HarnessOpenCode:
+			case domain.HarnessOpenCode, domain.HarnessOpenCodeV2:
 				// AO's own permission tiers, injected as OpenCode agents. OpenCode
 				// reports an agent's key as its display name, so they are relabelled
 				// here into the vocabulary the rest of AO uses. Its native build and

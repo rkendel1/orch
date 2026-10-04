@@ -72,6 +72,40 @@ func TestParsePiAnthropicAssistantUsesResponseModel(t *testing.T) {
 	assertPiTokens(t, event.Tokens, 19, 5, 14, 7)
 }
 
+func TestParsePiExplicitUsageEntry(t *testing.T) {
+	source := usageSource(domain.UsageSourcePiSession)
+	source.NativeRootID = "pi-session"
+	records := []jsonlRecord{
+		{Offset: 10, Data: []byte(`{"type":"usage","id":"warm-1","kind":"cache_warm","provider":"openai","model":"gpt-test","usage":{"input":4,"output":1,"cacheRead":2,"cacheWrite":1}}`)},
+		{Offset: 20, Data: []byte(`{"type":"usage","id":"warm-2","kind":"future_kind","provider":"anthropic","model":"claude-test","usage":{"input":5,"output":2,"cacheRead":3,"cacheWrite":1}}`)},
+	}
+	result := parseRecords(source, records, 30, time.Now())
+	if result.err != nil || len(result.Events) != 2 || result.Cursor.AnomalyCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	openai, anthropic := result.Events[0], result.Events[1]
+	if openai.ProviderID != domain.UsageProviderOpenAI || openai.BillingProviderID != "openai" ||
+		openai.ModelID != "gpt-test" || anthropic.ProviderID != domain.UsageProviderAnthropic ||
+		anthropic.BillingProviderID != "anthropic" || anthropic.ModelID != "claude-test" ||
+		openai.SourceEventKey == anthropic.SourceEventKey {
+		t.Fatalf("usage events = %+v", result.Events)
+	}
+	assertPiTokens(t, openai.Tokens, 7, 2, 5, 1)
+	assertPiTokens(t, anthropic.Tokens, 9, 3, 6, 2)
+}
+
+func TestParsePiSkipsAssistantWithoutUsageAndUnknownProvider(t *testing.T) {
+	source := usageSource(domain.UsageSourcePiSession)
+	records := []jsonlRecord{
+		{Data: []byte(`{"type":"message","id":"interrupted","message":{"role":"assistant","provider":"openai","model":"gpt-test"}}`)},
+		{Data: []byte(`{"type":"message","id":"gemini","message":{"role":"assistant","provider":"google","model":"gemini-test","usage":{"input":2,"output":1}}}`)},
+	}
+	result := parseRecords(source, records, 100, time.Now())
+	if result.err != nil || len(result.Events) != 0 || result.Cursor.AnomalyCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestParsePiRejectsInvalidUsage(t *testing.T) {
 	source := usageSource(domain.UsageSourcePiSession)
 	record := jsonlRecord{Data: []byte(`{"type":"message","id":"bad","message":{"role":"assistant","model":"m","usage":{"input":-1,"output":1}}}`)}

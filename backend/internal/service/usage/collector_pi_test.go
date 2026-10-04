@@ -2,11 +2,22 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
+
+type countingPiSessionStore struct {
+	collectorStore
+	listCalls int
+}
+
+func (s *countingPiSessionStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	s.listCalls++
+	return s.collectorStore.ListAllSessions(ctx)
+}
 
 func TestDefaultSourceRootsIncludesPiSessions(t *testing.T) {
 	home := t.TempDir()
@@ -126,5 +137,39 @@ func TestReadPiSessionMetaHonorsCanceledContext(t *testing.T) {
 
 	if _, ok := readPiSessionMeta(ctx, path); ok {
 		t.Fatal("canceled Pi metadata read succeeded")
+	}
+}
+
+func TestCollectorReconcilePiPathReturnsValidationAndCancellationErrors(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "invalid.txt")
+	writeUsageFixture(t, path, `{"type":"session","id":"pi-session","cwd":"/repo"}`+"\n")
+	collector := NewCollector(collectorTestStore(t), SourceRoots{PiSessions: root}, nil)
+	if err := collector.ReconcilePath(context.Background(), path); err == nil {
+		t.Fatal("invalid Pi transcript path was silently accepted")
+	}
+	if err := collector.ReconcilePath(context.Background(), filepath.Join(root, "missing.jsonl")); err == nil {
+		t.Fatal("missing Pi transcript path was silently accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := collector.ReconcilePath(ctx, path); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled reconcile error = %v", err)
+	}
+}
+
+func TestCollectorPiReconcileListsSessionsOnce(t *testing.T) {
+	baseStore := collectorTestStore(t)
+	store := &countingPiSessionStore{collectorStore: baseStore}
+	root := t.TempDir()
+	for _, id := range []string{"pi-one", "pi-two"} {
+		collectorTestSession(t, baseStore, domain.HarnessPi, id, false)
+		path := filepath.Join(root, id+".jsonl")
+		writeUsageFixture(t, path, `{"type":"session","id":"`+id+`","cwd":"/repo","version":3}`+"\n")
+	}
+	collector := NewCollector(store, SourceRoots{PiSessions: root}, nil)
+	mustNoError(t, collector.ReconcileSources(context.Background(), -1))
+	if store.listCalls != 1 {
+		t.Fatalf("session listings = %d, want 1", store.listCalls)
 	}
 }

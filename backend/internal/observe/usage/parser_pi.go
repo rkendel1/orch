@@ -14,6 +14,8 @@ type piSessionRecord struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id"`
 	Timestamp string          `json:"timestamp"`
+	Provider  string          `json:"provider"`
+	Model     string          `json:"model"`
 	Usage     json.RawMessage `json:"usage"`
 	Message   *struct {
 		Role          string          `json:"role"`
@@ -47,7 +49,18 @@ func parsePi(source domain.UsageSourceContext, records []jsonlRecord, result *pa
 			provider = strings.TrimSpace(native.Message.Provider)
 			model = firstNonEmpty(native.Message.ResponseModel, native.Message.Model)
 			usageRaw = native.Message.Usage
-			if model == "" || !jsonValueReported(usageRaw) {
+			if !jsonValueReported(usageRaw) {
+				continue
+			}
+			if model == "" {
+				recordMalformed(result)
+				continue
+			}
+		case native.Type == "usage":
+			provider = strings.TrimSpace(native.Provider)
+			model = strings.TrimSpace(native.Model)
+			usageRaw = native.Usage
+			if provider == "" || model == "" || !jsonValueReported(usageRaw) {
 				recordMalformed(result)
 				continue
 			}
@@ -74,13 +87,18 @@ func parsePi(source domain.UsageSourceContext, records []jsonlRecord, result *pa
 		}
 		providerID := domain.UsageProviderOpenAI
 		var tokens domain.UsageTokenMetrics
-		if strings.EqualFold(provider, "anthropic") {
+		switch {
+		case strings.EqualFold(provider, "anthropic"):
 			providerID = domain.UsageProviderAnthropic
 			tokens, ok = normalizeAnthropicUsage(
 				usage.Input, usage.CacheWrite, usage.CacheRead, usage.Output, nil, nil,
 			)
-		} else {
+		case provider == "" || strings.EqualFold(provider, "openai"):
 			tokens, ok = normalizeOpenAIUsage(input, usage.CacheRead, usage.CacheWrite, usage.Output)
+		default:
+			// The normalized usage schema currently supports only these two
+			// provider families. Do not label other providers as OpenAI.
+			continue
 		}
 		if !ok {
 			recordMalformed(result)

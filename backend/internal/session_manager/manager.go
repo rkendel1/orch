@@ -159,22 +159,24 @@ var (
 	// "spawn <id>:" so wrapping them does not change daemon-log wording, while
 	// errors.Is can tell the service which stage failed. More specific wrapped
 	// sentinels (branch, agent binary, chat preflight) still match first.
-	ErrSpawnPrompt         = errors.New("prompt")
-	ErrSpawnCreate         = errors.New("create")
-	ErrSpawnSystemPrompt   = errors.New("system prompt file")
-	ErrWorkspaceCreate     = errors.New("workspace")
-	ErrWorkspaceProvision  = errors.New("provision")
-	ErrSpawnAttachments    = errors.New("attachments")
-	ErrSpawnBrowser        = errors.New("browser capability")
-	ErrSpawnPrepare        = errors.New("prepare")
-	ErrSpawnPromptDelivery = errors.New("prompt delivery")
-	ErrSpawnLaunchCommand  = errors.New("launch command")
-	ErrSpawnSupervisor     = errors.New("supervisor")
-	ErrSpawnPrepareLaunch  = errors.New("prepare launch")
-	ErrRuntimeCreate       = errors.New("runtime")
-	ErrSpawnCommit         = errors.New("completed")
-	ErrSpawnDeliverPrompt  = errors.New("deliver prompt")
-	ErrChatController      = errors.New("chat controller")
+	ErrSpawnPrompt             = errors.New("prompt")
+	ErrSpawnCreate             = errors.New("create")
+	ErrSpawnSystemPrompt       = errors.New("system prompt file")
+	ErrWorkspaceCreate         = errors.New("workspace")
+	ErrWorkspaceProvision      = errors.New("provision")
+	ErrSpawnAttachments        = errors.New("attachments")
+	ErrSpawnBrowser            = errors.New("browser capability")
+	ErrSpawnPrepare            = errors.New("prepare")
+	ErrSpawnPromptDelivery     = errors.New("prompt delivery")
+	ErrSpawnLaunchCommand      = errors.New("launch command")
+	ErrSpawnSupervisor         = errors.New("supervisor")
+	ErrSpawnPrepareLaunch      = errors.New("prepare launch")
+	ErrRuntimeCreate           = errors.New("runtime")
+	ErrSpawnCommit             = errors.New("completed")
+	ErrSpawnDeliverPrompt      = errors.New("deliver prompt")
+	ErrClientRequestConflict   = errors.New("client request id belongs to a different task")
+	ErrClientRequestIncomplete = errors.New("client request has an incomplete prior spawn")
+	ErrChatController          = errors.New("chat controller")
 )
 
 // wrapSpawnStage annotates a spawn failure with a stage sentinel. The original
@@ -336,6 +338,9 @@ type Store interface {
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	CreateSession(ctx context.Context, rec domain.SessionRecord) (domain.SessionRecord, error)
 	CreateAutomationSession(ctx context.Context, rec domain.SessionRecord) (domain.SessionRecord, bool, error)
+	CreateClientRequestSession(ctx context.Context, rec domain.SessionRecord) (domain.SessionRecord, bool, error)
+	GetSessionByClientRequestID(ctx context.Context, id string) (domain.SessionRecord, bool, error)
+	CommitClientRequestSession(ctx context.Context, id domain.SessionID) error
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
 	UpdateSessionModel(ctx context.Context, id domain.SessionID, model string) (bool, error)
 	UpdateBrowserCapabilityVerifier(ctx context.Context, id domain.SessionID, expected domain.SessionControllerOwner, verifier string) (bool, error)
@@ -430,6 +435,9 @@ type Manager struct {
 	backgroundWorkers sync.WaitGroup
 	asyncChatSpawnsMu sync.Mutex
 	asyncChatSpawns   map[domain.SessionID]*asyncChatSpawnRun
+	// killTeardown bounds Kill's detached teardown. Zero means
+	// killTeardownBudget; tests shrink it to prove what survives its expiry.
+	killTeardown time.Duration
 	// openTranscriptFile is os.Open in production. The narrow seam lets tests
 	// deterministically prove that a post-stop transcript read failure falls
 	// back without advertising the provider path.
@@ -880,6 +888,16 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error) {
+	if cfg.ClientRequestID != "" {
+		existing, found, err := m.store.GetSessionByClientRequestID(ctx, cfg.ClientRequestID)
+		if err != nil {
+			return domain.SessionRecord{}, 0, 0, err
+		}
+		if found {
+			rec, err := replayClientRequest(existing, cfg.ClientRequestHash)
+			return rec, 0, 0, err
+		}
+	}
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
@@ -1026,7 +1044,14 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			seed.Metadata.Model = cfg.AgentConfig.Model
 			seed.Metadata.Effort = cfg.AgentConfig.Effort
 		}
-		if cfg.AutomationRunID != nil {
+		if cfg.ClientRequestID != "" {
+			var fresh bool
+			rec, fresh, err = m.store.CreateClientRequestSession(ctx, seed)
+			if err == nil && !fresh {
+				replay, replayErr := replayClientRequest(rec, cfg.ClientRequestHash)
+				return replay, promptBytes, systemPromptBytes, replayErr
+			}
+		} else if cfg.AutomationRunID != nil {
 			var fresh bool
 			rec, fresh, err = m.store.CreateAutomationSession(ctx, seed)
 			if err == nil && !fresh {
@@ -1080,6 +1105,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			cleanupCtx, cancel := spawnRollbackContext(ctx)
 			m.discardClaimedTaskPreparation(cleanupCtx, prep)
 			cancel()
+			if cfg.ClientRequestID != "" {
+				existing, found, lookupErr := m.store.GetSessionByClientRequestID(ctx, cfg.ClientRequestID)
+				if lookupErr == nil && found {
+					replay, replayErr := replayClientRequest(existing, cfg.ClientRequestHash)
+					return replay, promptBytes, systemPromptBytes, replayErr
+				}
+			}
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStageEarly(ErrSpawnCreate, err)
 		}
 	}
@@ -1121,6 +1153,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		})
 		if err == nil {
 			releaseHarness = nil // background start now owns the installer guard
+			if cfg.ClientRequestID != "" {
+				if commitErr := m.store.CommitClientRequestSession(ctx, started.ID); commitErr != nil {
+					return domain.SessionRecord{}, 0, 0, wrapSpawnStage(started.ID, ErrSpawnCommit, commitErr)
+				}
+			}
 		}
 		return started, promptBytes, systemPromptBytes, err
 	}
@@ -1198,6 +1235,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			rec, err = m.getRecord(ctx, id)
 			if err != nil {
 				return domain.SessionRecord{}, 0, 0, err
+			}
+		}
+		if cfg.ClientRequestID != "" {
+			if err := m.store.CommitClientRequestSession(ctx, id); err != nil {
+				return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
 			}
 		}
 		return rec, promptBytes, systemPromptBytes, nil
@@ -1348,6 +1390,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
 		}
 	}
+	if cfg.ClientRequestID != "" {
+		if err := m.store.CommitClientRequestSession(ctx, id); err != nil {
+			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
+		}
+	}
 	rec, err = m.getRecord(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, 0, 0, err
@@ -1369,6 +1416,16 @@ func (m *Manager) markAutomationLaunchCompleted(ctx context.Context, id domain.S
 	rec.AutomationLaunchCompleted = true
 	rec.UpdatedAt = m.clock()
 	return m.store.UpdateSession(ctx, rec)
+}
+
+func replayClientRequest(rec domain.SessionRecord, hash string) (domain.SessionRecord, error) {
+	if rec.ClientRequestHash != hash {
+		return domain.SessionRecord{}, ErrClientRequestConflict
+	}
+	if !rec.ClientRequestCommitted {
+		return domain.SessionRecord{}, ErrClientRequestIncomplete
+	}
+	return rec, nil
 }
 
 func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig, project domain.ProjectConfig) (ports.AgentConfig, error) {
@@ -2096,18 +2153,28 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 	return m.rollbackSpawn(ctx, id)
 }
 
-// workspacePreserved reports a teardown refusal that must not fail the kill.
-// All three cases leave the directory on disk and none is the user's problem to
-// resolve before the session can go away: uncommitted work is deliberately
-// never force-removed, a project whose repository has been deleted can never
-// have its worktree reclaimed by git at all, and a directory still pinned by a
-// process handle (Windows sharing violation) is deferred for a later cleanup
-// pass rather than unlinked mid-kill. Erroring instead strands the session in
-// the sidebar forever, which is the one outcome a delete must not produce.
-func workspacePreserved(err error) bool {
+// expectedWorkspaceRefusal reports a teardown refusal AO already has a name
+// for: uncommitted work that is deliberately never force-removed, a project
+// whose repository has been deleted, or a directory still pinned by a process
+// handle (Windows sharing violation). It only decides log volume — every
+// workspace teardown failure preserves the worktree, named or not.
+func expectedWorkspaceRefusal(err error) bool {
 	return errors.Is(err, ports.ErrWorkspaceDirty) ||
 		errors.Is(err, ports.ErrWorkspaceRepoUnavailable) ||
 		errors.Is(err, ports.ErrWorkspaceDeferred)
+}
+
+// terminateWithPreservedWorkspace records terminal intent for a session whose
+// workspace could not be released. Nothing was force-removed, so the worktree
+// is still on disk for `ao session cleanup` to retry and report on; what must
+// not survive is the session's claim on the sidebar. dropRestoreMarker is false
+// only for workspace projects, whose rows are left as non-restorable inventory
+// for the same retry.
+func (m *Manager) terminateWithPreservedWorkspace(ctx context.Context, id domain.SessionID, cause error, dropRestoreMarker bool) error {
+	if cause != nil && !expectedWorkspaceRefusal(cause) {
+		m.logger.Warn("kill: workspace teardown failed; worktree preserved", "sessionID", id, "error", cause)
+	}
+	return m.recordTermination(ctx, id, dropRestoreMarker)
 }
 
 // killTeardownBudget bounds the detached teardown Kill runs below. Sized just
@@ -2117,6 +2184,34 @@ func workspacePreserved(err error) bool {
 // hold this session's agent-operation lock (and the connection chi only
 // cancels, never aborts) for minutes on end.
 const killTeardownBudget = 90 * time.Second
+
+// terminalIntentBudget bounds the two writes that record a kill actually
+// happened. They run on their own context because by the time Kill reaches
+// them every destructive step is already done: refusing the write because the
+// teardown budget ran out mid-unlink leaves a session dead everywhere except
+// the row the UI reads, and `ao session cleanup` only walks terminated rows, so
+// nothing can reach it afterwards (#5463). Short, because these are two small
+// local writes, not the git and runtime calls the teardown budget exists for.
+const terminalIntentBudget = 15 * time.Second
+
+// recordTermination performs the writes that outlive teardown: the restore
+// marker must not survive a user kill (#2319) and the row must end up
+// terminated. Deliberately detached from the teardown budget — see
+// terminalIntentBudget.
+func (m *Manager) recordTermination(ctx context.Context, id domain.SessionID, dropRestoreMarker bool) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalIntentBudget)
+	defer cancel()
+	if dropRestoreMarker {
+		if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
+			m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+		}
+	}
+	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+		return fmt.Errorf("kill %s: %w", id, err)
+	}
+	m.cleanupSystemPromptDir(id)
+	return nil
+}
 
 // Kill tears down the runtime and workspace, then records terminal intent with
 // the LCM. A workspace teardown refused by the worktree-remove safety
@@ -2138,7 +2233,11 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	// tab used to produce. Values still flow through, so request-scoped logging
 	// keeps working; only the cancellation is dropped, under its own ceiling so
 	// a wedged git or runtime call cannot pin the goroutine forever.
-	ctx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	budget := m.killTeardown
+	if budget <= 0 {
+		budget = killTeardownBudget
+	}
+	ctx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancelTeardown()
 	if err := m.cancelAsyncChatSpawn(ctx, id); err != nil {
 		return false, fmt.Errorf("kill %s: cancel provisioning: %w", id, err)
@@ -2194,6 +2293,12 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
 		m.stopChatBestEffort(ctx, id)
 	} else if handle.ID != "" {
+		// Any Destroy error stops the kill. Every runtime's Destroy already
+		// returns nil when it confirms the session is absent, so an error means
+		// the runtime may still be live. Re-probing cannot settle it: conpty's
+		// IsAlive dials the host's listener, which Destroy's graceful shutdown
+		// closes before the PID exits, so a hung host reads as gone. Terminating
+		// then would leave a possibly-live agent with no row pointing at it.
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
 			return false, fmt.Errorf("kill %s: runtime: %w", id, err)
 		}
@@ -2212,17 +2317,8 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		release, err := m.beginShellTerminalTeardown(ctx, id)
 		if err != nil {
 			// Same shape as the dirty-workspace refusal below: the worktree is
-			// left alone, but the restore marker still must not survive a user
-			// kill, or the next boot's RestoreAll could resurrect a session the
-			// user explicitly terminated (#2319).
-			if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
-				m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
-			}
-			if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-				return false, fmt.Errorf("kill %s: %w", id, err)
-			}
-			m.cleanupSystemPromptDir(id)
-			return false, nil
+			// left alone and the session is still terminated.
+			return false, m.terminateWithPreservedWorkspace(ctx, id, nil, true)
 		}
 		if release != nil {
 			defer release()
@@ -2232,14 +2328,7 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	if workspaceProject {
 		reclaim, err := m.destroyWorkspaceProjectRows(ctx, workspaceProjectRows)
 		if err != nil {
-			if workspacePreserved(err) {
-				if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-					return false, fmt.Errorf("kill %s: %w", id, err)
-				}
-				m.cleanupSystemPromptDir(id)
-				return false, nil
-			}
-			return false, fmt.Errorf("kill %s: workspace: %w", id, err)
+			return false, m.terminateWithPreservedWorkspace(ctx, id, err, false)
 		}
 		freed = reclaim != ""
 		if freed {
@@ -2247,32 +2336,18 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		}
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
-			if workspacePreserved(err) {
-				if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
-					m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
-				}
-				if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-					return false, fmt.Errorf("kill %s: %w", id, err)
-				}
-				m.cleanupSystemPromptDir(id)
-				return false, nil
-			}
-			return false, fmt.Errorf("kill %s: workspace: %w", id, err)
+			return false, m.terminateWithPreservedWorkspace(ctx, id, err, true)
 		}
 		freed = true
 		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
 	}
-	// Clear the restore marker so the next boot's RestoreAll cannot resurrect a
-	// killed session (#2319). For workspace projects this must happen after
-	// teardown reads the rows; dirty-preserved rows return above and are left as
-	// non-restorable inventory.
-	if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
-		m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+	// Clearing the restore marker keeps the next boot's RestoreAll from
+	// resurrecting a killed session (#2319). For workspace projects it must
+	// happen after teardown reads the rows; dirty-preserved rows return above
+	// and are left as non-restorable inventory.
+	if err := m.recordTermination(ctx, id, true); err != nil {
+		return false, err
 	}
-	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-		return false, fmt.Errorf("kill %s: %w", id, err)
-	}
-	m.cleanupSystemPromptDir(id)
 	return freed, nil
 }
 
@@ -4549,7 +4624,7 @@ func (m *Manager) cleanupOne(ctx context.Context, rec domain.SessionRecord, ws p
 	} else if ok {
 		reclaim, err := m.destroyWorkspaceProjectRows(ctx, rows)
 		if err != nil {
-			if !workspacePreserved(err) {
+			if !expectedWorkspaceRefusal(err) {
 				m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
 			}
 			return ports.WorkspaceReclaimRemoved, cleanupSkipReason(err)
@@ -4565,7 +4640,7 @@ func (m *Manager) cleanupOne(ctx context.Context, rec domain.SessionRecord, ws p
 		err = m.workspace.Destroy(ctx, ws)
 	}
 	if err != nil {
-		if !workspacePreserved(err) {
+		if !expectedWorkspaceRefusal(err) {
 			// The public reason stays a fixed string (the raw error carries
 			// internal filesystem paths); the full cause lands here.
 			m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
@@ -4631,15 +4706,17 @@ func normalizeWorkspacePath(p string) string {
 
 func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now time.Time) domain.SessionRecord {
 	return domain.SessionRecord{
-		ProjectID:       cfg.ProjectID,
-		IssueID:         cfg.IssueID,
-		AutomationRunID: cfg.AutomationRunID,
-		Kind:            cfg.Kind,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		Harness:         cfg.Harness,
-		DisplayName:     cfg.DisplayName,
-		Activity:        domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+		ProjectID:         cfg.ProjectID,
+		IssueID:           cfg.IssueID,
+		AutomationRunID:   cfg.AutomationRunID,
+		ClientRequestID:   cfg.ClientRequestID,
+		ClientRequestHash: cfg.ClientRequestHash,
+		Kind:              cfg.Kind,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		Harness:           cfg.Harness,
+		DisplayName:       cfg.DisplayName,
+		Activity:          domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
