@@ -386,7 +386,7 @@ export function FileContentPane({
 						hideFileHeader
 					/>
 				) : effectiveMode === "rendered" && renderedAvailable ? (
-					<MarkdownFileView content={detail.content} filePath={path} hostId={hostId} sessionId={sessionId} truncated={detail.contentTruncated} version={query.dataUpdatedAt} />
+					<MarkdownFileView content={detail.content} filePath={path} hostId={hostId} sessionId={sessionId} artifactOrigin={artifactOriginOf(source)} truncated={detail.contentTruncated} version={query.dataUpdatedAt} />
 				) : (
 					fileView
 				)}
@@ -400,12 +400,21 @@ export function FileContentPane({
 			{toolbarNode}
 			<EditProvider createEditor={createReviewEditor}>
 			{effectiveMode === "rendered" && renderedAvailable ? (
-				<MarkdownFileView content={detail.content} filePath={path} hostId={hostId} sessionId={sessionId} truncated={detail.contentTruncated} version={query.dataUpdatedAt} />
+				<MarkdownFileView content={detail.content} filePath={path} hostId={hostId} sessionId={sessionId} artifactOrigin={artifactOriginOf(source)} truncated={detail.contentTruncated} version={query.dataUpdatedAt} />
 			) : fileView}
 			</EditProvider>
 			{saveError ? <p className="border-t border-error/40 bg-error/10 px-3 py-2 text-xs text-error" role="alert">{saveError}</p> : null}
 		</div>
 	);
+}
+
+function artifactOriginOf(source: FilesSource): string | undefined {
+	if (source.kind !== "artifact" || !source.rawUrl) return undefined;
+	try {
+		return new URL(source.rawUrl).origin;
+	} catch {
+		return undefined;
+	}
 }
 
 function CompleteFileView({ annotation, commitSha, detail, editing, onEditChange, scope, sessionId, hostId, source }: { annotation: FileAnnotationModel; commitSha?: string; detail: WorkspaceFileDetail; editing: boolean; onEditChange: (content: string) => void; scope: WorkspaceDiffScope; sessionId: string; hostId?: string; source: FilesSource }) {

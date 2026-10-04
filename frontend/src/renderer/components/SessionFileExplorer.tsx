@@ -502,6 +502,7 @@ export function SessionFileExplorer({
 					artifactTree={artifactTree}
 					feedbackRequestKey={artifactFeedbackRequestKey}
 					filter={filter}
+					hostId={hostId}
 					isMaximized={isMaximized}
 					onBack={() => setSelectedArtifactPath(null)}
 					onFeedbackRequestConsumed={onRevealRequestConsumed}
@@ -578,6 +579,7 @@ function ArtifactFilesPanel({
 	artifactTree,
 	feedbackRequestKey,
 	filter,
+	hostId,
 	isMaximized,
 	onBack,
 	onFeedbackRequestConsumed,
@@ -589,6 +591,7 @@ function ArtifactFilesPanel({
 	artifactTree: TreeNode[];
 	feedbackRequestKey?: number;
 	filter: string;
+	hostId?: string;
 	isMaximized: boolean;
 	onBack: () => void;
 	onFeedbackRequestConsumed?: (key: number) => void;
@@ -616,6 +619,7 @@ function ArtifactFilesPanel({
 						<ArtifactFileView
 							artifactName={artifact.name}
 							feedbackRequestKey={feedbackRequestKey}
+							hostId={hostId}
 							onFeedbackRequestConsumed={onFeedbackRequestConsumed}
 							path={artifact.path}
 							rawUrl={artifact.rawUrl}
@@ -646,6 +650,7 @@ function ArtifactFilesPanel({
 				<ArtifactFileView
 					artifactName={artifact.name}
 					feedbackRequestKey={feedbackRequestKey}
+					hostId={hostId}
 					onFeedbackRequestConsumed={onFeedbackRequestConsumed}
 					path={artifact.path}
 					rawUrl={artifact.rawUrl}

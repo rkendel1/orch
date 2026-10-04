@@ -222,7 +222,7 @@ function decodeArtifactText(bytes: Uint8Array, truncated: boolean): { binary: bo
 
 export function sessionArtifactFileQueryOptions(sessionId: string, path: string, rawUrl: string | undefined, errorMessage = "Unable to load artifact"): UseQueryOptions<WorkspaceFileDetail> {
 	return {
-		queryKey: ["session-artifact-file", sessionId, path],
+		queryKey: ["session-artifact-file", rawUrl ?? "", sessionId, path],
 		queryFn: () => fetchSessionArtifactFile(sessionId, path, rawUrl, errorMessage),
 	};
 }

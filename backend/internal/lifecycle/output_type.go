@@ -30,11 +30,16 @@ import (
 // session_output_type, so it cannot touch those other columns regardless of
 // how stale the read was.
 //
-// The method deliberately takes no lifecycle lock: the filesystem walk below
-// must never stall the reducer. A concurrent mutate cannot revert this write,
-// because UpdateSession's SET list does not name artifact_dir or
+// Reconciles are serialized on reconcileMu, a lock separate from the reducer's
+// mu: the scan-then-write below is not atomic, so two overlapping reconciles
+// (the poller and a PR claim, say) could otherwise persist an older scan over
+// a newer one and lose a combined pr_artifact. The filesystem walk therefore
+// never stalls lifecycle mutations. A concurrent mutate cannot revert this
+// write, because UpdateSession's SET list does not name artifact_dir or
 // session_output_type, so its full-row write leaves them as written here.
 func (m *Manager) ReconcileSessionOutputType(ctx context.Context, id domain.SessionID) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil || !ok {
 		return err

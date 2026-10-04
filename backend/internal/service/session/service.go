@@ -1196,7 +1196,7 @@ func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionReco
 		}
 		artifactFiles = nil
 	}
-	if backfilledArtifactDir || (len(artifactFiles) > 0 && !rec.OutputType.HasArtifact()) {
+	if backfilledArtifactDir || (len(artifactFiles) > 0) != rec.OutputType.HasArtifact() {
 		// Reflect the repair in this response's OutputType too, not just
 		// future ones: the persisted write below lands asynchronously
 		// relative to this read.

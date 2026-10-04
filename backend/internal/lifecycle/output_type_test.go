@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -223,5 +224,76 @@ func TestReconcileSessionOutputType_DoesNotResurrectSessionTerminatedDuringRead(
 	}
 	if got.OutputType != domain.SessionOutputArtifact {
 		t.Fatalf("OutputType = %q, want %q", got.OutputType, domain.SessionOutputArtifact)
+	}
+}
+
+func TestReconcileSessionOutputType_DeletingLastArtifactDropsBackToNone(t *testing.T) {
+	m, st, _ := newManager()
+	dir := t.TempDir()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:         "mer-1",
+		OutputType: domain.SessionOutputArtifact,
+		Metadata:   domain.SessionMetadata{ArtifactDir: dir},
+	}
+
+	if err := m.ReconcileSessionOutputType(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.sessions["mer-1"].OutputType; got != domain.SessionOutputNone {
+		t.Fatalf("outputType = %q, want %q after the last artifact was removed", got, domain.SessionOutputNone)
+	}
+}
+
+// gatedListStore blocks the first ListPRsBySession call until released, so a
+// test can force an older reconcile to sit between its read and its write
+// while a newer one runs.
+type gatedListStore struct {
+	*fakeStore
+	calls   int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedListStore) ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	prs, err := s.fakeStore.ListPRsBySession(ctx, id)
+	if atomic.AddInt32(&s.calls, 1) == 1 {
+		close(s.entered)
+		<-s.release
+	}
+	return prs, err
+}
+
+func TestReconcileSessionOutputType_OverlappingReconcilesCannotPersistStaleScan(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "report.html"), []byte("<html></html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", Metadata: domain.SessionMetadata{ArtifactDir: dir}}
+	gated := &gatedListStore{fakeStore: st, entered: make(chan struct{}), release: make(chan struct{})}
+	m := New(gated, &fakeMessenger{})
+
+	older := make(chan error, 1)
+	go func() { older <- m.ReconcileSessionOutputType(ctx, "mer-1") }()
+	<-gated.entered // the older reconcile has read "no PR" and is paused before writing.
+
+	st.prs["mer-1"] = []domain.PullRequest{{URL: "https://github.com/acme/repo/pull/1", Number: 1}}
+	newer := make(chan error, 1)
+	go func() { newer <- m.ReconcileSessionOutputType(ctx, "mer-1") }()
+
+	select {
+	case <-newer:
+		t.Fatal("a second reconcile ran while the first was mid-scan; stale writes are possible")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(gated.release)
+	if err := <-older; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-newer; err != nil {
+		t.Fatal(err)
+	}
+	if got := st.sessions["mer-1"].OutputType; got != domain.SessionOutputPRAndArtifact {
+		t.Fatalf("outputType = %q, want %q (the newer scan must win)", got, domain.SessionOutputPRAndArtifact)
 	}
 }

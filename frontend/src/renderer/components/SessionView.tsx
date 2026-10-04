@@ -29,6 +29,7 @@ import { CloudFileContentPane, CloudWorkspaceDiff } from "./CloudWorkspaceDiff";
 import { SessionFileTab } from "./SessionFileTabs";
 import { SessionFileWorkspace } from "./SessionFileWorkspace";
 import { SessionFilesPopOut } from "./SessionFilesPopOut";
+import { isArtifactPreviewUrl } from "../lib/artifact-preview";
 import { SessionBrowserPopOut } from "./SessionBrowserPopOut";
 import { SessionActionsMenu } from "./SessionActionsMenu";
 import { SessionInspector } from "./SessionInspector";
@@ -1108,12 +1109,16 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		if (hostId && remoteBase && browserSlotVisible) void remoteSessionQuery.refetch();
 	}, [hostId, remoteBase, browserSlotVisible, remoteSessionQuery.refetch]);
 	const terminated = session ? !sessionIsActive(session) : false;
+	// A completed session's HTML artifact is static output the daemon keeps
+	// serving, so an artifact preview the user opened stays visible; every other
+	// preview of a terminated session is a stale DB fact and is still torn down.
+	const browserTerminated = terminated && !(isArtifactPreviewUrl(previewUrl) && !hostId);
 	const browserView = useBrowserView({
 		sessionId: uiSessionId,
 		origin: hostId ? { hostId, sessionId, proxyBase: remoteBase ?? "" } : undefined,
 		active: browserSlotVisible,
 		poppedOut: browserPoppedOut,
-		terminated,
+		terminated: browserTerminated,
 		previewUrl,
 		previewRevision,
 	});
@@ -1128,7 +1133,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 	// suppresses and destroys the live preview for it, so it must not count as
 	// content here either — otherwise a merged/terminated session with an old
 	// preview auto-opens Browser onto a view the hook has already torn down.
-	const hasBrowserContent = !terminated && Boolean(previewUrl || browserUrl);
+	const hasBrowserContent = !browserTerminated && Boolean(previewUrl || browserUrl);
 
 	// Entering a session for the first time ever always starts on Summary. This
 	// must fire exactly once per session's *lifetime*, not once per "was this
