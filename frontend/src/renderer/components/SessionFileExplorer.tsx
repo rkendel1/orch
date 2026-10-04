@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
 	sessionSourceFilesQueryOptions,
+	sessionWorkspaceHistoryQueryOptions,
 	type FilesSource,
 	useWorkspaceFileConnectionState,
 	workspaceFilesRefetchInterval,
@@ -49,6 +50,8 @@ import { PanelMessage, RetryButton } from "./WorkspaceDiffView";
 import { WorkspaceReviewPane, type ReviewSourceMenu } from "./diffs/WorkspaceReviewPane";
 import { formatTimeTerse } from "../lib/format-time";
 import { ArtifactFileView } from "./ArtifactFileView";
+import { markFileViewerPerformance } from "../lib/file-viewer-performance";
+import { sessionUiKey } from "../lib/hosts";
 
 const WORKSPACE_SOURCE: FilesSource = { kind: "workspace" };
 const ARTIFACT_SOURCE: FilesSource = { kind: "artifact" };
@@ -60,24 +63,29 @@ const viewTabClass = "inline-flex h-control-md items-center rounded-md px-2.5 te
 type SessionFileExplorerProps = {
 	artifacts?: SessionArtifact[];
 	sessionId: string;
+	hostId?: string;
 	isMaximized?: boolean;
 	onOpenFile?: (path: string, options?: FileOpenOptions) => void;
 	onRevealRequestConsumed?: (key: number) => void;
 	onSplitChange?: (split: boolean) => void;
 	onToggleMaximized?: (next: boolean) => void;
 	revealRequest?: { feedback?: boolean; path: string; key: number; source?: "artifact" } | null;
+	/** Called once a reveal request has opened its file, so the owner can drop it. */
+	onRevealHandled?: (key: number) => void;
 	split?: boolean;
 };
 
 export function SessionFileExplorer({
 	artifacts = [],
 	sessionId,
+	hostId,
 	isMaximized = false,
 	onOpenFile,
 	onRevealRequestConsumed,
 	onSplitChange,
 	onToggleMaximized,
 	revealRequest,
+	onRevealHandled,
 	split: controlledSplit,
 }: SessionFileExplorerProps) {
 	const { t } = useTranslation();
@@ -95,16 +103,19 @@ export function SessionFileExplorer({
 	const [selectedPRCommit, setSelectedPRCommit] = useState<{ url: string; sha: string } | null>(null);
 	const filesTopbarHost = useFilesTopbarHost();
 	const [treeOpen, setTreeOpen] = useState(true);
-	const scmQuery = useSessionScmSummary(sessionId);
+	const uiKey = sessionUiKey(sessionId, hostId);
+	const scmQuery = useSessionScmSummary(sessionId, true, undefined, false, hostId);
 	const prSummaries = scmQuery.data?.prs ?? [];
 	const queryClient = useQueryClient();
-	const connectionState = useWorkspaceFileConnectionState(sessionId);
+	const connectionState = useWorkspaceFileConnectionState(sessionId, hostId);
+	useLayoutEffect(() => markFileViewerPerformance("files-shell-painted"), []);
 
-	const changedOnly = useUiStore((state) => state.inspectorSessions[sessionId]?.filesChangedOnly ?? true);
-	const source = useUiStore((state) => state.inspectorSessions[sessionId]?.filesSource ?? WORKSPACE_SOURCE);
+	const changedOnly = useUiStore((state) => state.inspectorSessions[uiKey]?.filesChangedOnly ?? true);
+	const source = useUiStore((state) => state.inspectorSessions[uiKey]?.filesSource ?? WORKSPACE_SOURCE);
 	const setFilesChangedOnly = useUiStore((state) => state.setFilesChangedOnly);
 	const setFilesSource = useUiStore((state) => state.setFilesSource);
 	const annotation = useFileAnnotation(sessionId, {
+		hostId,
 		source: source.kind === "pull_request" ? `${source.label} (${source.url})` : "Workspace",
 	});
 	const snapshot = source.kind === "pull_request" ? prSummaries.find((pr) => pr.url === source.url)?.headSha ?? "" : "";
@@ -123,23 +134,47 @@ export function SessionFileExplorer({
 			: undefined;
 
 	const filesQuery = useQuery({
-		...sessionSourceFilesQueryOptions(sessionId, querySource, t("files.error.loadWorkspace")),
+		...sessionSourceFilesQueryOptions(sessionId, querySource, t("files.error.loadWorkspace"), hostId),
 		enabled: source.kind !== "artifact",
 		refetchInterval: (query) => workspaceFilesRefetchInterval(connectionState, Boolean(query.state.data?.degraded)),
 	});
+	useLayoutEffect(() => {
+		if (filesQuery.data) markFileViewerPerformance("manifest-ready");
+	}, [filesQuery.data?.workspaceVersion]);
+	// Commit history and ahead/behind are not part of the latency-sensitive
+	// manifest. Load the legacy enrichment only after the first useful Changes
+	// snapshot is already available, so it can never gate opening Files.
+	const historyQuery = useQuery({
+		...sessionWorkspaceHistoryQueryOptions(sessionId, t("files.error.loadWorkspace"), hostId),
+		enabled: source.kind === "workspace" && Boolean(filesQuery.data),
+	});
+	const filesData = useMemo(
+		() => source.kind === "workspace" && filesQuery.data
+			? {
+				...filesQuery.data,
+				...(historyQuery.data ? {
+					ahead: historyQuery.data.ahead,
+					behind: historyQuery.data.behind,
+					commits: historyQuery.data.commits,
+					commitsTruncated: historyQuery.data.commitsTruncated,
+				} : {}),
+			}
+			: filesQuery.data,
+		[filesQuery.data, historyQuery.data, source.kind],
+	);
 	// A PR's own commits (the Workspace's live in its Changes review). Picking one
 	// narrows the tree and the preview to that commit.
-	const prCommits = source.kind === "pull_request" ? filesQuery.data?.commits ?? [] : [];
+	const prCommits = source.kind === "pull_request" ? filesData?.commits ?? [] : [];
 	const prCommit = source.kind === "pull_request" && selectedPRCommit?.url === source.url
 		? prCommits.find((commit) => commit.sha === selectedPRCommit.sha)
 		: undefined;
-	const sourceFiles = prCommit?.files ?? filesQuery.data?.files;
+	const sourceFiles = prCommit?.files ?? filesData?.files;
 	const changedOnlyData = useMemo(
 		() => (sourceFiles ? buildChangedOnlyTree(sourceFiles) : []),
 		[sourceFiles],
 	);
-	const hasChanges = filesQuery.data?.files.some((file) => file.status !== "unmodified") ?? false;
-	const showChanges = source.kind === "workspace" && changedOnly && (!filesQuery.data || hasChanges);
+	const hasChanges = filesData?.files.some((file) => file.status !== "unmodified") ?? false;
+	const showChanges = source.kind === "workspace" && changedOnly && (!filesData || hasChanges);
 	const splitView = !showChanges && (isMaximized || source.kind === "pull_request");
 	const sourceUnavailable = source.kind === "pull_request"
 		&& (filesQuery.isError || Boolean(scmQuery.data && !prSummaries.some((pr) => pr.url === source.url)));
@@ -150,31 +185,35 @@ export function SessionFileExplorer({
 		setFilter("");
 		setSourceNotice("");
 		setSelectedPRCommit(null);
-	}, [sessionId]);
+	}, [uiKey]);
 
 	useEffect(() => {
 		if (!sourceUnavailable) return;
-		setFilesSource(sessionId, WORKSPACE_SOURCE);
+		setFilesSource(uiKey, WORKSPACE_SOURCE);
 		setSelectedPath(null);
 		setSourceNotice(t("files.explorer.sourceUnavailable"));
-	}, [sessionId, setFilesSource, sourceUnavailable, t]);
+	}, [uiKey, setFilesSource, sourceUnavailable, t]);
 
-	useEffect(() => subscribeWorkspaceFileChanges(sessionId, queryClient), [queryClient, sessionId]);
+	useEffect(() => subscribeWorkspaceFileChanges(sessionId, queryClient, hostId), [queryClient, sessionId, hostId]);
 	useEffect(() => {
 		window.localStorage.setItem("ao.files.diffStyle", split ? "split" : "unified");
 	}, [split]);
 	useEffect(() => {
 		if (!revealRequest) return;
 		if (revealRequest.source === "artifact") {
-			setFilesSource(sessionId, ARTIFACT_SOURCE);
+			setFilesSource(uiKey, ARTIFACT_SOURCE);
 			setSelectedArtifactPath(revealRequest.path);
 			return;
 		}
-		setFilesSource(sessionId, WORKSPACE_SOURCE);
-		setFilesChangedOnly(sessionId, false);
+		setFilesSource(uiKey, WORKSPACE_SOURCE);
+		setFilesChangedOnly(uiKey, false);
 		setSelectedPath(revealRequest.path);
-		if (!isMaximized) onOpenFile?.(revealRequest.path, { mode: "file" });
-	}, [isMaximized, onOpenFile, revealRequest, sessionId, setFilesChangedOnly, setFilesSource]);
+		// Maximized, the file is shown in this view's own preview; the request
+		// stays pending so un-maximizing still opens it in the centre.
+		if (isMaximized) return;
+		onOpenFile?.(revealRequest.path, { mode: "file" });
+		onRevealHandled?.(revealRequest.key);
+	}, [isMaximized, onOpenFile, onRevealHandled, revealRequest, uiKey, setFilesChangedOnly, setFilesSource]);
 
 	const handleSelectPath = (node: TreeNode) => {
 		setPreviewRequest(null);
@@ -187,12 +226,12 @@ export function SessionFileExplorer({
 	const handleViewChange = (next: boolean) => {
 		setPreviewRequest(null);
 		setSelectedPath(null);
-		setFilesChangedOnly(sessionId, next);
+		setFilesChangedOnly(uiKey, next);
 	};
 	const openInMaximizedPreview = (path: string, options?: FileOpenOptions) => {
 		setPreviewRequest((current) => ({ ...options, key: (current?.key ?? 0) + 1 }));
 		setSelectedPath(path);
-		setFilesChangedOnly(sessionId, false);
+		setFilesChangedOnly(uiKey, false);
 	};
 	const treeSelectedPath = selectedPath;
 	const selectedPreviousPath = sourceFiles?.find((file) => file.path === selectedPath)?.previousPath;
@@ -233,11 +272,11 @@ export function SessionFileExplorer({
 		setSelectedPath(null);
 		setSelectedPRCommit(null);
 		if (value === "workspace") {
-			setFilesSource(sessionId, WORKSPACE_SOURCE);
+			setFilesSource(uiKey, WORKSPACE_SOURCE);
 			return;
 		}
 		const pr = prSummaries.find((candidate) => candidate.url === value);
-		if (pr) setFilesSource(sessionId, { kind: "pull_request", number: pr.number, url: pr.url, label: `PR #${pr.number} · ${pr.sourceBranch || pr.title}` });
+		if (pr) setFilesSource(uiKey, { kind: "pull_request", number: pr.number, url: pr.url, label: `PR #${pr.number} · ${pr.sourceBranch || pr.title}` });
 	};
 
 	// The Changes view only exists for the workspace; for a PR the switch would
@@ -477,26 +516,27 @@ export function SessionFileExplorer({
 					<PanelMessage action={<RetryButton onClick={() => void filesQuery.refetch()} />}>
 						{filesQuery.error.message || t("files.error.loadWorkspace")}
 					</PanelMessage>
-				) : filesQuery.data ? (
+				) : filesData ? (
 					<WorkspaceReviewPane
 						annotation={annotation}
-						data={filesQuery.data}
+						data={filesData}
+						hostId={hostId}
 						filter={filter}
 						onBrowseAll={() => source.kind === "workspace" && handleViewChange(false)}
-						canOpenInCenter={!isMaximized}
+						canOpenInCenter={!isMaximized && Boolean(onOpenFile)}
 						onOpenFile={isMaximized ? openInMaximizedPreview : onOpenFile}
 						onSourceMenuChange={setReviewMenu}
 						sessionId={sessionId}
 						split={split}
 					/>
 				) : null
-			) : isMaximized || source.kind === "pull_request" ? (
+			) : splitView ? (
 				// Preview on the left, tree on the right (collapsible from the header),
 				// like an editor's changed-files rail.
 				<ResizablePanelGroup className="min-h-0 flex-1 border-t border-border">
 					<ResizablePanel defaultSize="74%" minSize="40%">
 						<ContentScrollArea>
-							<FileContentPane annotation={annotation} commitSha={prCommit?.sha ?? previewRequest?.commitSha} initialEditing={previewRequest?.editing ?? false} initialMode={previewRequest?.mode} initialRequestKey={previewRequest?.key ?? 0} path={selectedPath} previousPath={selectedPreviousPath} scope={previewRequest?.scope} sessionId={sessionId} source={querySource} split={split} toolbar="compact" />
+							<FileContentPane annotation={annotation} commitSha={prCommit?.sha ?? previewRequest?.commitSha} hostId={hostId} initialEditing={previewRequest?.editing ?? false} initialMode={previewRequest?.mode} initialRequestKey={previewRequest?.key ?? 0} path={selectedPath} previousPath={selectedPreviousPath} scope={previewRequest?.scope} sessionId={sessionId} source={querySource} split={split} toolbar="compact" />
 						</ContentScrollArea>
 					</ResizablePanel>
 					{treeOpen ? (
@@ -504,6 +544,7 @@ export function SessionFileExplorer({
 							<ResizableHandle />
 							<ResizablePanel defaultSize="26%" minSize="18%" maxSize="50%">
 								<FileTree
+									hostId={hostId}
 									changedOnly={source.kind === "pull_request"}
 									changedOnlyData={changedOnlyData}
 									filterText={filter}
@@ -519,6 +560,7 @@ export function SessionFileExplorer({
 				// The right rail remains a persistent navigator. File contents open
 				// in center tabs so expanding folders and scrolling the tree survive.
 				<FileTree
+					hostId={hostId}
 					changedOnly={false}
 					changedOnlyData={changedOnlyData}
 					filterText={filter}

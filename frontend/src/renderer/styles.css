@@ -1083,14 +1083,14 @@ button.settings-row-bar {
 .composer-run-controls {
 	display: grid;
 	min-width: 0;
-	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	grid-template-columns: minmax(max-content, 1fr) minmax(0, 1fr);
 	align-items: center;
 	column-gap: var(--space-2);
 }
 
 .composer-run-controls-with-effort {
-	/* Capability-driven Agent / Model / Effort sizing: 2 / 2 / 1. */
-	grid-template-columns: minmax(0, 2fr) minmax(0, 2fr) minmax(5.5rem, 1fr);
+	/* Agent and model share free room; effort keeps enough width for its selected label. */
+	grid-template-columns: minmax(max-content, 1fr) minmax(0, 1fr) minmax(max-content, 0.5fr);
 }
 
 .composer-toolbar-slot {
@@ -1185,7 +1185,8 @@ button.settings-row-bar {
    its text, which reads as a stray half-width box once it sits in a menu. */
 @utility menu-search-input {
 	width: 100%;
-	height: var(--size-settings-action-height);
+	/* Match DropdownMenuItem's text-control line height, py-1.5, and border. */
+	height: calc(var(--line-height-row) + (var(--space-1_5) * 2) + 2px);
 	border: 1px solid var(--color-border-settings-input);
 	border-radius: var(--radius-md);
 	background-color: var(--color-bg-settings-input);

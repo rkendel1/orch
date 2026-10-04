@@ -94,6 +94,8 @@ export type AgentSwitchSummary = {
 
 export type WorkspaceSession = {
 	id: string;
+	/** Installation ID of the daemon that owns this session; absent for local and Cloud. */
+	hostId?: string;
 	terminalHandleId?: string;
 	/** Opaque controller generation; changes even when a restarted PTY reuses its handle. */
 	terminalGeneration?: string;
@@ -386,6 +388,8 @@ export type { AttentionZone } from "../lib/session-presentation";
 
 export type WorkspaceSummary = {
 	id: string;
+	/** Installation ID of the daemon that owns this project; absent for local and Cloud. */
+	hostId?: string;
 	name: string;
 	/**
 	 * Discriminator for where the project lives. Local projects carry the
