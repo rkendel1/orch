@@ -32,6 +32,8 @@ func parseQwen(source domain.UsageSourceContext, records []jsonlRecord, result *
 		}
 		model := firstNonEmpty(native.Model)
 		identity := firstNonEmpty(native.ID)
+		// Qwen's current validator accepts versions through 1. A future version
+		// needs review before its fields can be mapped into AO's token buckets.
 		if native.SchemaVersion != 1 || model == "" || identity == "" ||
 			native.InputTokens < 0 || native.OutputTokens < 0 ||
 			native.CachedTokens < 0 || native.ThoughtsTokens < 0 {
@@ -48,6 +50,8 @@ func parseQwen(source domain.UsageSourceContext, records []jsonlRecord, result *
 			recordMalformed(result)
 			continue
 		}
+		// AO requires cached input to be a subset of input so uncached input
+		// remains non-negative, even though Qwen's validator is more permissive.
 		tokens, ok := normalizeOpenAIUsage(
 			native.InputTokens, native.CachedTokens, 0, output,
 		)

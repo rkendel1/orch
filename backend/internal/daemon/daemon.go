@@ -700,6 +700,13 @@ func Run() error {
 		usagePipeline = usagepipeline.NewPipeline(store, ingestor, usagePipelineWatchRoots(roots), usagepipeline.CoordinatorConfig{
 			Logger:     log,
 			Initialize: usageCollector.BackfillActive,
+			WatchRoots: func(watchCtx context.Context) ([]string, error) {
+				qwenRoots, err := usageCollector.QwenWatchRoots(watchCtx)
+				if err != nil {
+					return nil, err
+				}
+				return append(usagePipelineWatchRoots(roots), qwenRoots...), nil
+			},
 			Reconcile: func(reconcileCtx context.Context) error {
 				return usageCollector.ReconcileSources(reconcileCtx, 0)
 			},

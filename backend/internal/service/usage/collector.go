@@ -202,6 +202,36 @@ func (c *Collector) qwenUsageRoot(ctx context.Context, sessionID domain.SessionI
 	if !ok {
 		return "", fmt.Errorf("%w: %s", ErrUsageSessionNotFound, sessionID)
 	}
+	return c.qwenUsageRootForSession(ctx, session)
+}
+
+// QwenWatchRoots makes registered workspace sources eligible for exact-file
+// watches, including when the workspace differs from the global Qwen root.
+func (c *Collector) QwenWatchRoots(ctx context.Context) ([]string, error) {
+	sessions, err := c.store.ListAllSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	roots := make(map[string]struct{})
+	for _, session := range sessions {
+		if session.Harness != domain.HarnessQwen {
+			continue
+		}
+		root, err := c.qwenUsageRootForSession(ctx, session)
+		if err != nil {
+			return nil, err
+		}
+		roots[root] = struct{}{}
+	}
+	result := make([]string, 0, len(roots))
+	for root := range roots {
+		result = append(result, root)
+	}
+	slices.Sort(result)
+	return result, nil
+}
+
+func (c *Collector) qwenUsageRootForSession(ctx context.Context, session domain.SessionRecord) (string, error) {
 	workspace := strings.TrimSpace(session.Metadata.WorkspacePath)
 	if workspace == "" {
 		return c.roots.QwenUsage, nil

@@ -123,6 +123,11 @@ func TestCollectorDiscoversWorkspaceRelativeQwenUsage(t *testing.T) {
 	})
 	mustNoError(t, err)
 	collector := NewCollector(store, SourceRoots{QwenUsage: filepath.Join(home, ".qwen", "usage")}, nil)
+	roots, err := collector.QwenWatchRoots(context.Background())
+	mustNoError(t, err)
+	if want := filepath.Join(workspace, ".qwen-runtime", "usage"); !slices.Equal(roots, []string{want}) {
+		t.Fatalf("watch roots = %v, want %q", roots, want)
+	}
 	mustNoError(t, collector.RecordHook(context.Background(), session.ID, HookSignal{
 		Harness: domain.HarnessQwen, Event: "session-start", NativeSessionID: nativeID,
 	}))
