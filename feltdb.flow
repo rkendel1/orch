@@ -1,0 +1,431 @@
+// FeltDB Durable State Model for Agent Orchestrator
+// This is the authoritative definition of all durable facts persisted by AO.
+// Generated collections are derived from this flow.
+
+// Core Domain
+
+collection "projects" {
+  // Project/repo registry (YAML config twin)
+  id: string @primary
+  path: string
+  repo_origin_url: string
+  display_name: string
+  registered_at: timestamp
+  archived_at: timestamp? // soft-delete
+}
+
+collection "sessions" {
+  // Durable session fact row; one per agent/worker session
+  // Display status (working, needs_input, etc.) is DERIVED at read time from:
+  // - activity_state, is_terminated (durable facts below)
+  // - PR facts (from pullRequests collection)
+  // NEVER store display status.
+  id: string @primary
+  project_id: string @index
+  num: integer
+  kind: string // "worker" | "orchestrator"
+  harness: string // agent name or ""
+  session_mode: string // "tui" | "chat"
+  activity_state: string // "active" | "idle" | "waiting_input" | "blocked" | "exited"
+  activity_last_at: timestamp
+  is_terminated: boolean
+  branch: string
+  workspace_path: string
+  runtime_handle_id: string
+  provider_conversation_id: string // Chat provider thread ID
+  controller_generation: string // controller epoch for fencing
+  agent_session_id: string // agent-specific resume ID (TUI only)
+
+  // Non-lifecycle but durable config
+  issue_id: string
+  prompt: string
+  display_name: string
+  preview_url: string
+  preview_revision: string
+  terminate_on_pr_merge: boolean
+  is_pinned: boolean
+  pinned_at: timestamp?
+  diff_base_sha: string
+  diff_base_ref: string
+  runtime_launch_id: string
+  browser_capability_verifier: string
+  auto_inject_review: boolean
+  auto_inject_ci: boolean
+  auto_review: boolean
+  metadata: json?
+
+  created_at: timestamp
+  updated_at: timestamp
+
+  @unique(project_id, num)
+  @index(activity_state)
+  @index(is_terminated)
+}
+
+collection "workspaceRepos" {
+  // Git worktree state per session
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  path: string
+  repo_path: string
+  branch: string
+  default_branch: string
+  created_at: timestamp
+}
+
+collection "shellTerminals" {
+  // Session-scoped shell escape terminals (worktree access)
+  id: string @primary
+  session_id: string @index
+  workspace_id: string
+  shell_type: string
+  created_at: timestamp
+}
+
+// Conversation System (Chat Mode)
+
+collection "conversations" {
+  // Durable conversation narratives (Chat mode, branching timelines)
+  id: string @primary
+  scope: string // "session" | "project"
+  project_id: string @index
+  session_id: string? @index // nullable, NULL for project scope
+  current_session_id: string? // controller currently responsible
+  latest_sequence: integer // ordering counter
+  active_branch_id: string
+  created_at: timestamp
+  updated_at: timestamp
+
+  @unique(session_id) // only when scope="session"
+  @unique(project_id) // only when scope="project"
+}
+
+collection "conversationTurns" {
+  // One user request + the agent work it caused
+  id: string @primary
+  conversation_id: string @index
+  handled_by_session_id: string @index
+  provider_turn_id: string
+  controller_generation: string
+  branch_id: string @index
+  state: string // "queued" | "running" | "completed" | "interrupted" | "failed"
+  error_message: string
+  requested_at: timestamp
+  started_at: timestamp?
+  completed_at: timestamp?
+  promotion_started_at: timestamp?
+  promoted_to_turn_id: string?
+
+  @index(conversation_id, requested_at)
+  @unique(conversation_id, provider_turn_id)
+}
+
+collection "conversationMessages" {
+  // Readable text timeline entries (prose only, not activities)
+  id: string @primary
+  conversation_id: string @index
+  branch_id: string @index
+  turn_id: string?
+  sequence: integer
+  revision: integer
+  role: string // "user" | "assistant"
+  origin: string // "human" | "automation" | "daemon" | "provider"
+  text: string
+  streaming: boolean
+  provider_item_id: string
+  client_message_id: string
+  created_at: timestamp
+  updated_at: timestamp
+
+  @unique(conversation_id, sequence)
+  @unique(conversation_id, provider_item_id)
+  @unique(conversation_id, client_message_id)
+  @index(branch_id, sequence)
+}
+
+collection "conversationActivities" {
+  // Non-prose timeline entries (commands, plans, approvals, usage, errors)
+  id: string @primary
+  conversation_id: string @index
+  branch_id: string @index
+  turn_id: string?
+  sequence: integer
+  revision: integer
+  kind: string // "command" | "file_change" | "plan" | "reasoning" | "approval" | "usage" | "error" | "system" | "mcp" | "auto_review"
+  status: string // "running" | "completed" | "failed" | "pending" | "resolved"
+  summary: string
+  detail_json: json
+  request_id: string
+  provider_item_id: string
+  created_at: timestamp
+  updated_at: timestamp
+
+  @unique(conversation_id, sequence)
+  @unique(conversation_id, provider_item_id)
+  @unique(conversation_id, request_id)
+  @index(conversation_id, kind, status)
+  @index(branch_id, sequence)
+}
+
+collection "conversationBranches" {
+  // Provider thread lineage (branching timelines)
+  id: string @primary
+  conversation_id: string @index
+  session_id: string?
+  provider_conversation_id: string
+  parent_branch_id: string?
+  fork_after_turn_id: string?
+  replaced_turn_id: string?
+  replacement_turn_id: string?
+  fork_after_sequence: integer
+  created_at: timestamp
+
+  @unique(conversation_id, provider_conversation_id)
+  @index(conversation_id, parent_branch_id, fork_after_sequence)
+}
+
+collection "conversationProviderEvents" {
+  // Raw provider event log (append-only, deduplication + audit)
+  id: integer @primary @autoincrement
+  conversation_id: string @index
+  session_id: string
+  branch_id: string @index
+  provider_event_id: string
+  method: string
+  payload_json: json
+  received_at: timestamp
+
+  @unique(conversation_id, provider_event_id)
+  @index(conversation_id, id)
+}
+
+// Pull Requests & Code Review
+
+collection "pullRequests" {
+  // PR facts keyed by URL
+  url: string @primary
+  session_id: string @index
+  number: integer
+  pr_state: string // "draft" | "open" | "merged" | "closed"
+  review_decision: string // "none" | "approved" | "changes_requested" | "review_required"
+  ci_state: string // "unknown" | "pending" | "passing" | "failing"
+  mergeability: string // "unknown" | "mergeable" | "conflicting" | "blocked" | "unstable"
+  auto_inject_ci: boolean
+  updated_at: timestamp
+}
+
+collection "prChecks" {
+  // CI run history (one row per PR, check, commit)
+  pr_url: string
+  name: string
+  commit_hash: string
+  status: string // "unknown" | "queued" | "in_progress" | "passed" | "failed" | "skipped" | "cancelled"
+  url: string
+  log_tail: string
+  created_at: timestamp
+
+  @primary(pr_url, name, commit_hash)
+  @index(pr_url, name, created_at)
+}
+
+collection "prComments" {
+  // Review comments, persisted to avoid GitHub polls on every read
+  pr_url: string
+  comment_id: string
+  author: string
+  file: string
+  line: integer
+  body: string
+  resolved: boolean
+  created_at: timestamp
+
+  @primary(pr_url, comment_id)
+}
+
+collection "prReviewThreads" {
+  // GitHub PR review thread state (per PR)
+  pr_url: string
+  thread_id: string
+  author: string
+  file: string
+  line: integer
+  state: string // "PENDING" | "COMMENTED" | "APPROVED" | "DISMISSED" | "RESOLVED"
+  body: string
+  resolved_at: timestamp?
+  created_at: timestamp
+
+  @primary(pr_url, thread_id)
+}
+
+collection "prReviews" {
+  // GitHub PR review verdicts
+  url: string @primary
+  pr_url: string @index
+  session_id: string?
+  author: string
+  state: string // "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"
+  body: string
+  target_sha: string
+  created_at: timestamp
+
+  @index(pr_url, target_sha)
+}
+
+collection "reviewRuns" {
+  // Automated code review execution state
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  harness: string
+  agent_session_id: string?
+  pr_url: string @index
+  target_sha: string
+  batch_id: string
+  status: string // "pending" | "running" | "completed" | "failed" | "cancelled"
+  verdict: string // "" | "approved" | "changes_requested" | "dismiss"
+  body: string
+  retry_count: integer
+  retry_cancelled: boolean
+  retry_failed: boolean
+  github_review_id: string
+  delivered_at: timestamp?
+  created_at: timestamp
+  updated_at: timestamp
+
+  @index(session_id, pr_url, target_sha, harness)
+}
+
+collection "reviews" {
+  // Per-harness code review state tracking
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  harness: string
+  pr_url: string
+  reviewer_handle_id: string
+  agent_session_id: string
+  created_at: timestamp
+  updated_at: timestamp
+
+  @unique(session_id, harness)
+}
+
+// Notifications & Alerts
+
+collection "notifications" {
+  // User-facing alerts and events
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  type: string
+  status: string // "unread" | "read" | "resolved"
+  pr_url: string
+  summary: string
+  detail_json: json
+  resolved_at: timestamp?
+  created_at: timestamp
+
+  @unique(session_id, type, pr_url)
+  @index(resolved_at, created_at)
+}
+
+// Session Lifecycle & Handoff
+
+collection "sessionInterfaceTransitions" {
+  // TUI↔Chat mode handoff state and messaging
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  source_mode: string
+  target_mode: string
+  policy: string // "drain" | "interrupt"
+  status: string // "in_progress" | "completed" | "failed" | "rolled_back"
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+collection "sessionInterfaceTransitionMessages" {
+  // Durable outbox for messages during handoff
+  id: string @primary
+  transition_id: string @index
+  session_id: string @index
+  sender: string // "source" | "target" | "automation"
+  message_json: json
+  delivery_status: string // "pending" | "delivered" | "failed"
+  created_at: timestamp
+}
+
+collection "agentSwitches" {
+  // TUI→Chat or Chat→TUI switch history
+  id: string @primary
+  session_id: string @index
+  project_id: string @index
+  source_mode: string
+  target_mode: string
+  source_provider: string
+  target_provider: string
+  final_handoff_path: string
+  final_handoff_hash: string
+  source_transcript_status: string
+  semantic_handoff_included: boolean
+  status: string
+  created_at: timestamp
+}
+
+// Configuration & Tracking
+
+collection "appSettings" {
+  // Application configuration state
+  key: string @primary
+  value_json: json
+  updated_at: timestamp
+}
+
+collection "agentModelCatalog" {
+  // Model availability and configuration
+  id: string @primary
+  project_id: string @index
+  model_id: string
+  provider: string
+  config_json: json
+  updated_at: timestamp
+}
+
+collection "telemetryEvents" {
+  // Event logging and analytics
+  id: string @primary
+  project_id: string @index
+  session_id: string? @index
+  event_type: string
+  properties_json: json
+  created_at: timestamp
+}
+
+collection "modelUsageEvents" {
+  // LLM model usage tracking
+  id: string @primary
+  project_id: string @index
+  session_id: string? @index
+  conversation_id: string? @index
+  model_id: string
+  usage_json: json
+  created_at: timestamp
+}
+
+// Change Data Capture (CDC)
+// FeltDB subscriptions replace SQLite triggers + polling.
+// Each collection change triggers a subscription event carrying the mutation fact.
+
+collection "changeLog" {
+  // Durable, append-only change event log (compatibility/audit layer)
+  // In steady state, this is generated from FeltDB subscription events.
+  seq: integer @primary @autoincrement
+  project_id: string @index
+  session_id: string? @index
+  event_type: string
+  payload: json
+  created_at: timestamp
+
+  @index(project_id, seq)
+}
