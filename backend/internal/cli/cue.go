@@ -12,13 +12,15 @@ import (
 
 // These DTOs mirror the daemon's Cue API without importing controller types.
 type cueDTO struct {
-	ID          string `json:"id"`
-	ProjectID   string `json:"projectId"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Type        string `json:"type"`
-	Command     string `json:"command"`
-	Prompt      string `json:"prompt"`
+	RunOnWorktreeCreation bool   `json:"runOnWorktreeCreation,omitempty"`
+	StartupShell          string `json:"startupShell,omitempty"`
+	StartupTimeoutSeconds int    `json:"startupTimeoutSeconds,omitempty"`
+	ID                    string `json:"id"`
+	ProjectID             string `json:"projectId"`
+	Name                  string `json:"name"`
+	Type                  string `json:"type"`
+	Command               string `json:"command"`
+	Prompt                string `json:"prompt"`
 }
 
 type cueEnvelopeDTO struct {
@@ -30,11 +32,13 @@ type cueListDTO struct {
 }
 
 type cueCreateDTO struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Type        string `json:"type"`
-	Command     string `json:"command,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
+	RunOnWorktreeCreation bool   `json:"runOnWorktreeCreation,omitempty"`
+	StartupShell          string `json:"startupShell,omitempty"`
+	StartupTimeoutSeconds int    `json:"startupTimeoutSeconds,omitempty"`
+	Name                  string `json:"name"`
+	Type                  string `json:"type"`
+	Command               string `json:"command,omitempty"`
+	Prompt                string `json:"prompt,omitempty"`
 }
 
 func newCueCommand(ctx *commandContext) *cobra.Command {
@@ -49,8 +53,10 @@ func newCueCommand(ctx *commandContext) *cobra.Command {
 }
 
 func newCueCreateCommand(ctx *commandContext) *cobra.Command {
-	var project, name, description, command, prompt string
-	var jsonOutput bool
+	var project, name, command, prompt string
+	var jsonOutput, startup bool
+	var startupShell string
+	var startupTimeout int
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a command or agent Cue",
@@ -66,7 +72,13 @@ func newCueCreateCommand(ctx *commandContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			body := cueCreateDTO{Name: name, Description: description}
+			if startup && strings.TrimSpace(command) == "" {
+				return usageError{errors.New("--on-worktree-creation requires --command")}
+			}
+			if startupTimeout < 1 || startupTimeout > 86400 {
+				return usageError{errors.New("--startup-timeout must be between 1 and 86400 seconds")}
+			}
+			body := cueCreateDTO{Name: name, RunOnWorktreeCreation: startup, StartupShell: startupShell, StartupTimeoutSeconds: startupTimeout}
 			if strings.TrimSpace(command) != "" {
 				body.Type, body.Command = "command", command
 			} else {
@@ -83,9 +95,11 @@ func newCueCreateCommand(ctx *commandContext) *cobra.Command {
 			return err
 		},
 	}
+	cmd.Flags().BoolVar(&startup, "on-worktree-creation", false, "Run this command Cue before the first turn of each new worktree (replaces the current selection)")
+	cmd.Flags().StringVar(&startupShell, "startup-shell", "", "Shell executable for worktree startup (default: platform shell)")
+	cmd.Flags().IntVar(&startupTimeout, "startup-timeout", 600, "Worktree startup command timeout in seconds")
 	cmd.Flags().StringVar(&project, "project", "", "Project id (default: AO_PROJECT_ID, current session, or current registered repo)")
 	cmd.Flags().StringVar(&name, "name", "", "Cue name")
-	cmd.Flags().StringVar(&description, "description", "", "Optional Cue description")
 	cmd.Flags().StringVar(&command, "command", "", "Exact shell command for a command Cue")
 	cmd.Flags().StringVar(&prompt, "prompt", "", "Reusable agent instruction for an agent Cue")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Print JSON")
@@ -113,9 +127,9 @@ func newCueListCommand(ctx *commandContext) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), response)
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			_, _ = fmt.Fprintln(writer, "ID\tNAME\tTYPE\tDESCRIPTION")
+			_, _ = fmt.Fprintln(writer, "ID\tNAME\tTYPE")
 			for _, cue := range response.Cues {
-				_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", cue.ID, cue.Name, cue.Type, cue.Description)
+				_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\n", cue.ID, cue.Name, cue.Type)
 			}
 			return writer.Flush()
 		},

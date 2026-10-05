@@ -13,11 +13,15 @@ import { CUE_LIMITS } from "../lib/cues";
 import type { CueDTO, CueInput } from "../lib/cues";
 import { Button } from "./ui/button";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { SettingsOptionMenu } from "./settings/SettingsOptionMenu";
 
 type CuesSettingsProps = {
 	projectId: string;
 	onBusyChange?: (busy: boolean) => void;
+	createOnly?: boolean;
+	onCreated?: () => void;
+	onCancel?: () => void;
 };
 
 type CueType = "command" | "agent";
@@ -28,23 +32,27 @@ function cueType(cue: CueDTO): CueType {
 
 type CueDraft = {
 	name: string;
-	description: string;
 	type: CueType;
 	command: string;
 	prompt: string;
+	runOnWorktreeCreation: boolean;
+	startupShell: string;
+	startupTimeoutMinutes: number;
 };
 
 function emptyDraft(): CueDraft {
-	return { name: "", description: "", type: "command", command: "", prompt: "" };
+	return { name: "", type: "command", command: "", prompt: "", runOnWorktreeCreation: false, startupShell: "", startupTimeoutMinutes: 10 };
 }
 
 function draftFromDTO(cue: CueDTO): CueDraft {
 	return {
 		name: cue.name,
-		description: cue.description ?? "",
 		type: cueType(cue),
 		command: cue.command ?? "",
 		prompt: cue.prompt ?? "",
+		runOnWorktreeCreation: cue.runOnWorktreeCreation ?? false,
+		startupShell: cue.startupShell ?? "",
+		startupTimeoutMinutes: (cue.startupTimeoutSeconds ?? 600) / 60,
 	};
 }
 
@@ -59,15 +67,20 @@ export function CuesSettings(props: CuesSettingsProps) {
 	return <ProjectCuesSettings key={props.projectId} {...props} />;
 }
 
-function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
+function ProjectCuesSettings({ projectId, onBusyChange, createOnly = false, onCreated, onCancel }: CuesSettingsProps) {
 	const { t } = useTranslation();
 	const showGlobalToast = useUiStore((state) => state.showGlobalToast);
-	const cuesQuery = useProjectCuesQuery(projectId);
+	const cuesQuery = useProjectCuesQuery(projectId, !createOnly);
+	useEffect(() => {
+		if (!createOnly && cuesQuery.isError && !cuesQuery.isFetching) {
+			showGlobalToast(t("cues.loadFailed"), apiErrorMessage(cuesQuery.error, t("cues.loadFailed")), { tone: "error", dedupeKey: `cues.load.${projectId}` });
+		}
+	}, [projectId, createOnly, cuesQuery.isError, cuesQuery.isFetching, cuesQuery.error, showGlobalToast, t]);
 	const createMutation = useCreateCueMutation(projectId);
 	const updateMutation = useUpdateCueMutation(projectId);
 	const deleteMutation = useDeleteCueMutation(projectId);
 
-	const [formOpen, setFormOpen] = useState<"new" | CueDTO | null>(null);
+	const [formOpen, setFormOpen] = useState<"new" | CueDTO | null>(createOnly ? "new" : null);
 	const [deletingCue, setDeletingCue] = useState<CueDTO | null>(null);
 	const [draft, setDraft] = useState<CueDraft>(emptyDraft);
 	const [formError, setFormError] = useState<string | null>(null);
@@ -109,10 +122,16 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 		const input: CueInput = {
 			name: trimmedName,
 			type: draft.type,
-			description: draft.description || undefined,
 		};
 		if (draft.type === "command") {
 			input.command = draft.command;
+			if (draft.runOnWorktreeCreation && (!Number.isFinite(draft.startupTimeoutMinutes) || draft.startupTimeoutMinutes < 1 / 60 || draft.startupTimeoutMinutes > 1440)) {
+				setFormError(t("cues.startupTimeoutInvalid"));
+				return;
+			}
+			input.runOnWorktreeCreation = draft.runOnWorktreeCreation;
+			input.startupShell = draft.startupShell;
+			input.startupTimeoutSeconds = Math.round(draft.startupTimeoutMinutes * 60);
 		} else {
 			input.prompt = draft.prompt;
 		}
@@ -122,7 +141,7 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 			return;
 		}
 		const encoder = new TextEncoder();
-		for (const [value, limit, field] of [[trimmedName, CUE_LIMITS.name, t("cues.nameLabel")], [draft.description, CUE_LIMITS.description, t("cues.descriptionLabel")], [content, draft.type === "command" ? CUE_LIMITS.command : CUE_LIMITS.prompt, t(draft.type === "command" ? "cues.commandLabel" : "cues.agentLabel")]] as const) {
+		for (const [value, limit, field] of [[trimmedName, CUE_LIMITS.name, t("cues.nameLabel")], [content, draft.type === "command" ? CUE_LIMITS.command : CUE_LIMITS.prompt, t(draft.type === "command" ? "cues.commandLabel" : "cues.agentLabel")]] as const) {
 			if (encoder.encode(value).length > limit) {
 				setFormError(t("cues.fieldTooLong", { field, limit }));
 				return;
@@ -135,16 +154,15 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 			if (formOpen === "new") {
 				await createMutation.mutateAsync(input);
 				if (!mounted.current) return;
-				showGlobalToast(t("cues.created"), t("cues.createdBody", { name: trimmedName }));
 			} else {
 				await updateMutation.mutateAsync({ cueId: formOpen.id, input });
 				if (!mounted.current) return;
-				showGlobalToast(t("cues.saved"), t("cues.savedBody", { name: trimmedName }));
 			}
-			setFormOpen(null);
+			if (createOnly) onCreated?.();
+			else setFormOpen(null);
 		} catch (error) {
 			if (!mounted.current) return;
-			setFormError(apiErrorMessage(error, t("cues.saveFailed")));
+			showGlobalToast(t("cues.saveFailed"), apiErrorMessage(error, t("cues.saveFailed")), "error");
 		} finally {
 			pending.current = false;
 			if (mounted.current) setSaving(false);
@@ -158,7 +176,6 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 		try {
 			await deleteMutation.mutateAsync(deletingCue.id);
 			if (!mounted.current) return;
-			showGlobalToast(t("cues.deleted"), t("cues.deletedBody", { name: deletingCue.name }));
 			setDeletingCue(null);
 		} catch (error) {
 			if (!mounted.current) return;
@@ -215,12 +232,9 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 										<div className="flex items-baseline gap-2 text-sm leading-5 text-foreground">
 											<span className="truncate font-medium">{cue.name}</span>
 											<span className="shrink-0 text-xs text-settings-muted">
-												{cueKind === "agent" ? t("cues.typeName.agent") : t("cues.typeName.command")}
+												{cue.runOnWorktreeCreation ? t("cues.startupSelected") : cueKind === "agent" ? t("cues.typeName.agent") : t("cues.typeName.command")}
 											</span>
 										</div>
-										{cue.description ? (
-											<p className="truncate text-xs leading-4 text-settings-muted">{cue.description}</p>
-										) : null}
 									</div>
 									<div className="flex shrink-0 items-center gap-0.5">
 										<Button
@@ -276,19 +290,6 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 			</div>
 
 			<div className="flex flex-col gap-1.5">
-				<label htmlFor="cue-description" className="settings-field-label">
-					{t("cues.descriptionLabel")}
-				</label>
-				<input
-					id="cue-description"
-					value={draft.description}
-					onChange={(event) => setDraft((d) => ({ ...d, description: event.target.value }))}
-					placeholder={t("cues.descriptionPlaceholder")}
-					className="settings-field-control h-(--size-settings-action-height) rounded-md!"
-				/>
-			</div>
-
-			<div className="flex flex-col gap-1.5">
 				<label className="settings-field-label">{t("cues.typeLabel")}</label>
 				<SettingsOptionMenu
 					aria-label={t("cues.typeLabel")}
@@ -300,7 +301,7 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 					triggerClassName="w-fit self-start"
 					menuAlign="start"
 					menuClassName="border-0! shadow-md!"
-					onChange={(type) => setDraft((current) => ({ ...current, type }))}
+					onChange={(type) => setDraft((current) => ({ ...current, type, runOnWorktreeCreation: type === "command" && current.runOnWorktreeCreation }))}
 				/>
 			</div>
 
@@ -320,6 +321,29 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 				/>
 			</div>
 
+			{command ? <div className="flex flex-col gap-3">
+				<label className="flex items-center gap-2 text-sm">
+					<input type="checkbox" checked={draft.runOnWorktreeCreation}
+						onChange={(event) => setDraft((d) => ({ ...d, runOnWorktreeCreation: event.target.checked }))} />
+					{t("cues.runOnWorktreeCreation")}
+				</label>
+				{draft.runOnWorktreeCreation ? <>
+					<p className="text-xs text-settings-muted">{t("cues.startupSelectionHelp")}</p>
+					<label className="flex flex-col gap-1.5 settings-field-label">
+						{t("cues.startupShell")}
+						<SettingsOptionMenu aria-label={t("cues.startupShell")} value={draft.startupShell}
+							options={[{ value: "", label: t("cues.platformShell") }, ...["sh", "bash", "zsh", "fish", "cmd.exe", "powershell.exe", "pwsh"].map((shell) => ({ value: shell, label: shell }))]}
+							onChange={(startupShell) => setDraft((d) => ({ ...d, startupShell }))} />
+					</label>
+					<label className="flex flex-col gap-1.5 settings-field-label" htmlFor="cue-startup-timeout">
+						{t("cues.startupTimeout")}
+						<input id="cue-startup-timeout" type="number" min={1/60} max={1440} step="any"
+							className="settings-field-control h-(--size-settings-action-height) rounded-md!"
+							value={draft.startupTimeoutMinutes} onChange={(event) => setDraft((d) => ({ ...d, startupTimeoutMinutes: Number(event.target.value) }))} />
+					</label>
+				</> : null}
+			</div> : null}
+
 			{formError ? (
 				<p role="alert" className="text-caption leading-4 text-error">
 					{formError}
@@ -336,7 +360,7 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 			<div className="flex items-center justify-end gap-2">
 				{formOpen ? (
 					<>
-						<Button type="button" variant="outline" disabled={saving} onClick={() => setFormOpen(null)}>
+						<Button type="button" variant="outline" disabled={saving} onClick={() => createOnly ? onCancel?.() : setFormOpen(null)}>
 							{t("cues.cancel")}
 						</Button>
 						<Button type="button" disabled={saving} onClick={() => void handleSave()}>
@@ -367,5 +391,34 @@ function ProjectCuesSettings({ projectId, onBusyChange }: CuesSettingsProps) {
 				}}
 			/>
 		</div>
+	);
+}
+
+/** Session-local creation surface; shares the settings editor and validation. */
+export function CreateCueDialog({ projectId, open, onOpenChange, onClosed }: {
+	projectId: string;
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	onClosed?: () => void;
+}) {
+	const { t } = useTranslation();
+	const [busy, setBusy] = useState(false);
+	return (
+		<Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}>
+			<DialogContent showCloseButton={!busy} aria-describedby={undefined}
+				onCloseAutoFocus={(event) => {
+					if (!onClosed) return;
+					event.preventDefault();
+					onClosed();
+				}}>
+				<DialogHeader>
+					<DialogTitle>{t("cues.newCue")}</DialogTitle>
+				</DialogHeader>
+				{open ? (
+					<CuesSettings projectId={projectId} createOnly onBusyChange={setBusy}
+						onCreated={() => onOpenChange(false)} onCancel={() => onOpenChange(false)} />
+				) : null}
+			</DialogContent>
+		</Dialog>
 	);
 }

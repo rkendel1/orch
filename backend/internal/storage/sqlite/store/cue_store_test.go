@@ -21,11 +21,51 @@ func sampleCue(id, project, name string, typ domain.CueType) domain.Cue {
 	}
 	if typ == domain.CueTypeCommand {
 		cue.Command = "pnpm test"
-		cue.Description = "Run the test suite"
 	} else {
 		cue.Prompt = "Run the test suite, investigate failures, and fix them."
 	}
 	return cue
+}
+
+func TestStartupCueSelectionReplacesAtomicallyAndRollsBackOnError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	first := sampleCue("one", "mer", "First", domain.CueTypeCommand)
+	first.RunOnWorktreeCreation = true
+	second := sampleCue("two", "mer", "Second", domain.CueTypeCommand)
+	if err := s.InsertCue(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertCue(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	second.RunOnWorktreeCreation = true
+	if _, _, err := s.UpdateCue(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	selected, found, err := s.SelectStartupCue(ctx, "mer")
+	if err != nil || !found || selected.ID != second.ID || selected.StartupTimeoutSeconds != 600 {
+		t.Fatalf("selection: %+v %v", selected, err)
+	}
+	old, _, err := s.SelectCueByID(ctx, first.ID)
+	if err != nil || old.RunOnWorktreeCreation {
+		t.Fatal("previous selection was not cleared")
+	}
+	first.Name = second.Name // fails uniqueness after the transaction clears the old flag
+	if _, _, err := s.UpdateCue(ctx, first); !errors.Is(err, domain.ErrCueNameExists) {
+		t.Fatalf("duplicate: %v", err)
+	}
+	selected, _, err = s.SelectStartupCue(ctx, "mer")
+	if err != nil || selected.ID != second.ID {
+		t.Fatal("failed save lost the selected cue")
+	}
+	if _, err := s.DeleteCueByID(ctx, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := s.SelectStartupCue(ctx, "mer"); err != nil || found {
+		t.Fatal("deleted cue retained startup selection")
+	}
 }
 
 // TestCueInsertAndSelectRoundTrip pins command and agent cue round-trips: every
@@ -47,7 +87,7 @@ func TestCueInsertAndSelectRoundTrip(t *testing.T) {
 			t.Fatalf("select %s: ok=%v err=%v", cue.ID, ok, err)
 		}
 		if got.ID != cue.ID || got.ProjectID != cue.ProjectID || got.Name != cue.Name ||
-			got.Description != cue.Description || got.Type != cue.Type ||
+			got.Type != cue.Type ||
 			got.Command != cue.Command || got.Prompt != cue.Prompt ||
 			!got.CreatedAt.Equal(cue.CreatedAt) || !got.UpdatedAt.Equal(cue.UpdatedAt) {
 			t.Fatalf("round-trip mismatch: got %+v want %+v", got, cue)
