@@ -183,8 +183,10 @@ type BridgeService struct {
 	//
 	// Lists, not single addresses: the phone races every endpoint, so a machine
 	// on both Wi-Fi and Ethernet must advertise both. Host and TailscaleHost are
-	// derived from the head of each list so the singular fields and the list can
-	// never disagree.
+	// the head of each scan, kept for the existing renderer. The advertised
+	// list's tailnet entry is derived from the same scan but may be the
+	// secure-pairing proxy instead of the address, or absent — see
+	// mobilebridge.Endpoints.
 	PickLANHosts       func() []string
 	PickTailscaleHosts func() []string
 	// Secure-pairing collaborators. All nil in production (daemon.go wires the
@@ -258,26 +260,22 @@ func first(hosts []string) string {
 func (b *BridgeService) Status() MobileStatusResponse {
 	st, _ := mobilebridge.Load(b.ConfigPath)
 	enabled := st.Enabled && b.LAN.Running()
-	lan := b.lanHosts()
-	ts := b.tailscaleHosts()
-	if st.LoopbackOnly {
-		lan, ts = nil, nil
+	sp := b.securePairingStatus(st.SecurePairing && !st.LoopbackOnly, enabled)
+	if st.ServeCleanupPending && sp.Reason == "" {
+		sp.Reason = "clear_failed"
 	}
+	in := b.endpointInputs(st.LoopbackOnly, sp)
 	res := MobileStatusResponse{
 		Enabled:       enabled,
 		LoopbackOnly:  st.LoopbackOnly,
-		Host:          first(lan),
-		TailscaleHost: first(ts),
-		Port:          b.LAN.BoundPort(),
+		Host:          first(in.LANHosts),
+		TailscaleHost: first(in.TailscaleHosts),
+		Port:          in.Port,
 		Warning:       mobileUnencryptedWarning,
-		Endpoints: mobilebridge.Endpoints(mobilebridge.EndpointInputs{
-			LANHosts:       lan,
-			TailscaleHosts: ts,
-			Port:           b.LAN.BoundPort(),
-			Tunnel:         b.tunnelEndpoint(),
-		}),
-		Tunnel: b.tunnelStatus(),
-		HostID: b.HostID,
+		Endpoints:     mobilebridge.Endpoints(in),
+		Tunnel:        b.tunnelStatus(),
+		HostID:        b.HostID,
+		SecurePairing: sp,
 	}
 	// Only surface the password while the bridge is actually enabled. This route
 	// is reachable only on the loopback listener (the LAN listener 404s
@@ -285,28 +283,58 @@ func (b *BridgeService) Status() MobileStatusResponse {
 	if enabled {
 		res.Password = st.Password
 	}
-	res.SecurePairing = b.securePairingStatus(st.SecurePairing, enabled)
-	if st.ServeCleanupPending && res.SecurePairing.Reason == "" {
-		res.SecurePairing.Reason = "clear_failed"
-	}
 	res.KeepAwake = b.keepAwakeStatus(st.KeepAwake)
 	return res
 }
 
 // AdvertisedEndpoints reports how this daemon can currently be reached, for
-// the phone's refresh route. Same list Status carries, so the two cannot drift.
+// the phone's refresh route. Built from the same inputs Status uses, so the
+// list in the pairing code and the list a paired phone refreshes to cannot
+// drift — including the secure-pairing proxy, which is what lets a phone that
+// paired before the proxy existed pick it up on its next connect.
+//
+// With secure pairing on, this makes the same two tailscale CLI calls Status
+// makes, each bounded by tailscaleTimeout. A phone away from the LAN refreshes
+// about once a minute while in the foreground (its upgrade race), so that is
+// the cadence of those calls per such phone. With the mode off nothing here
+// touches the CLI.
 func (b *BridgeService) AdvertisedEndpoints() []mobilebridge.Endpoint {
 	st, _ := mobilebridge.Load(b.ConfigPath)
+	enabled := st.Enabled && b.LAN.Running()
+	sp := b.securePairingStatus(st.SecurePairing && !st.LoopbackOnly, enabled)
+	return mobilebridge.Endpoints(b.endpointInputs(st.LoopbackOnly, sp))
+}
+
+// endpointInputs gathers everything the candidate list is built from. The
+// only place that reads the network position, so Status and AdvertisedEndpoints
+// describe the machine identically.
+func (b *BridgeService) endpointInputs(loopbackOnly bool, sp SecurePairingStatus) mobilebridge.EndpointInputs {
 	var lan, ts []string
-	if !st.LoopbackOnly {
+	if !loopbackOnly {
 		lan, ts = b.lanHosts(), b.tailscaleHosts()
 	}
-	return mobilebridge.Endpoints(mobilebridge.EndpointInputs{
+	return mobilebridge.EndpointInputs{
 		LANHosts:       lan,
 		TailscaleHosts: ts,
 		Port:           b.LAN.BoundPort(),
 		Tunnel:         b.tunnelEndpoint(),
-	})
+		SecurePairing:  securePairingState(sp),
+	}
+}
+
+// securePairingState reduces the status block to what the candidate list
+// needs. The proxy's address is passed only while Active, which already folds
+// in the mode being off, a missing CLI, no tailnet certificates, a failed
+// serve, and a proxy pinned to a stale port (securePairingStatus); anything
+// weaker would advertise the MagicDNS name while :443 proxies something else.
+// Enabled is passed separately so the list can tell "mode on, proxy not
+// verified" from "mode off" — the two advertise the tailnet differently.
+func securePairingState(sp SecurePairingStatus) mobilebridge.SecurePairingState {
+	st := mobilebridge.SecurePairingState{Enabled: sp.Enabled}
+	if sp.Active {
+		st.Host, st.Port = sp.Host, sp.Port
+	}
+	return st
 }
 
 // tunnel reads the current connector without resolving one.
@@ -413,7 +441,20 @@ func (b *BridgeService) securePairingStatus(on, bridgeUp bool) SecurePairingStat
 		}
 		return sp
 	}
+	// The phone gives endpoint refresh five seconds. Both Tailscale reads have
+	// their own three-second limit, so doing them in sequence can time out the
+	// phone even when both succeed. They only read local Tailscale state and do
+	// not depend on each other.
+	var targetC chan int
+	if bridgeUp && serveErr == nil {
+		targetC = make(chan int, 1)
+		go func() { targetC <- b.serveTarget() }()
+	}
 	info := b.queryTS()
+	target := 0
+	if targetC != nil {
+		target = <-targetC
+	}
 	switch {
 	case info.Name == "":
 		sp.Reason = "no_cli"
@@ -431,7 +472,7 @@ func (b *BridgeService) securePairingStatus(on, bridgeUp bool) SecurePairingStat
 		sp.Reason = "serve_failed"
 		return sp
 	}
-	if b.serveTarget() != b.LAN.BoundPort() {
+	if target != b.LAN.BoundPort() {
 		sp.Reason = "port_mismatch"
 		return sp
 	}
