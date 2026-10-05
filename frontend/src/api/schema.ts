@@ -48,7 +48,7 @@ export interface paths {
         /** Get the current or last install job for one agent harness */
         get: operations["getAgentInstallStatus"];
         put?: never;
-        /** Start an asynchronous install for one fixed agent harness */
+        /** Start an asynchronous install, update, or uninstall for one fixed agent harness */
         post: operations["startAgentInstall"];
         delete?: never;
         options?: never;
@@ -101,6 +101,23 @@ export interface paths {
         put?: never;
         /** Ensure launch-fresh readiness for one agent adapter */
         post: operations["probeAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/update-advisory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Compare an installed harness version with its known package source */
+        get: operations["getAgentUpdateAdvisory"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3037,6 +3054,12 @@ export interface components {
             reinstallAvailable: boolean;
             reinstallCommand?: string;
             reinstallReason?: string;
+            uninstallAvailable: boolean;
+            uninstallCommand?: string;
+            uninstallReason?: string;
+            updateAvailable: boolean;
+            updateCommand?: string;
+            updateReason?: string;
         };
         AgentInstallPlan: {
             agentId: string;
@@ -3139,6 +3162,15 @@ export interface components {
         };
         AgentSwitchResponse: {
             switch: components["schemas"]["AgentSwitch"];
+        };
+        AgentUpdateAdvisory: {
+            agentId: string;
+            /** Format: date-time */
+            checkedAt: string;
+            currentVersion?: string;
+            latestVersion?: string;
+            source?: string;
+            status: string;
         };
         AttachmentInput: {
             data: string;
@@ -5028,7 +5060,7 @@ export interface components {
              * @description Requested operation. Defaults to install for older clients.
              * @enum {string}
              */
-            operation?: "install" | "reinstall";
+            operation?: "install" | "reinstall" | "update" | "uninstall";
         };
         StartCodexAccountSwitchRequest: {
             /** @deprecated */
@@ -5727,6 +5759,56 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProbeAgentResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getAgentUpdateAdvisory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent adapter identifier. */
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentUpdateAdvisory"];
                 };
             };
             /** @description Bad Request */

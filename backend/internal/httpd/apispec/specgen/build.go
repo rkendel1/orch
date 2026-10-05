@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/githubpat"
 	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	"github.com/aoagents/agent-orchestrator/backend/internal/service/systeminstall"
 )
 
 // Build reflects the Go contract types and the operation registry below into
@@ -382,6 +383,7 @@ var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names
 	"SysteminstallJob":                            "InstallJob",
 	"SysteminstallAgentPlan":                      "AgentInstallPlan",
 	"SysteminstallAgentInstallMethod":             "AgentInstallMethod",
+	"SysteminstallUpdateAdvisory":                 "AgentUpdateAdvisory",
 	"ControllersAgentInstallerCatalogResponse":    "AgentInstallerCatalogResponse",
 	"ControllersStartAgentInstallRequest":         "StartAgentInstallRequest",
 	"ControllersAgentInstallJobsResponse":         "AgentInstallJobsResponse",
@@ -1485,8 +1487,19 @@ func agentOperations() []operation {
 			},
 		},
 		{
+			method: http.MethodGet, path: "/api/v1/agents/{agent}/update-advisory", id: "getAgentUpdateAdvisory", tag: "agents",
+			summary:    "Compare an installed harness version with its known package source",
+			pathParams: []any{controllers.AgentIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, systeminstall.UpdateAdvisory{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
 			method: http.MethodPost, path: "/api/v1/agents/{agent}/install", id: "startAgentInstall", tag: "agents",
-			summary:    "Start an asynchronous install for one fixed agent harness",
+			summary:    "Start an asynchronous install, update, or uninstall for one fixed agent harness",
 			pathParams: []any{controllers.AgentIDParam{}},
 			reqBody:    controllers.StartAgentInstallRequest{}, optionalReqBody: true,
 			resps: []respUnit{

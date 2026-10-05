@@ -170,6 +170,9 @@ type Plan struct {
 	Target              Target
 	Command             []string // argv, e.g. ["brew", "install", "tmux"]
 	Script              *ports.InstallScriptCommand
+	Package             string
+	PackagePrefix       string
+	PackageCask         bool
 	Manager             string // resolving package manager ("brew", "apt-get", ...), empty when none applies
 	NeedsRoot           bool   // Command must run as root; the caller supplies the privilege
 	Unsupported         bool
@@ -209,10 +212,15 @@ type AgentInstallMethod struct {
 	ReinstallAvailable  bool   `json:"reinstallAvailable"`
 	ReinstallCommand    string `json:"reinstallCommand,omitempty"`
 	ReinstallReason     string `json:"reinstallReason,omitempty"`
+	UpdateAvailable     bool   `json:"updateAvailable"`
+	UpdateCommand       string `json:"updateCommand,omitempty"`
+	UpdateReason        string `json:"updateReason,omitempty"`
+	UninstallAvailable  bool   `json:"uninstallAvailable"`
+	UninstallCommand    string `json:"uninstallCommand,omitempty"`
+	UninstallReason     string `json:"uninstallReason,omitempty"`
 }
 
-// AgentOperation distinguishes a first installation from an explicit rebuild
-// of an existing harness environment.
+// AgentOperation selects a fixed install, reinstall, update, or uninstall plan.
 type AgentOperation string
 
 const (
@@ -220,10 +228,14 @@ const (
 	AgentOperationInstall AgentOperation = "install"
 	// AgentOperationReinstall requests an explicit rebuild of an existing installation.
 	AgentOperationReinstall AgentOperation = "reinstall"
+	// AgentOperationUpdate refreshes the installed agent CLI using its selected method.
+	AgentOperationUpdate AgentOperation = "update"
+	// AgentOperationUninstall removes the installed agent CLI using its selected method.
+	AgentOperationUninstall AgentOperation = "uninstall"
 )
 
 func (operation AgentOperation) valid() bool {
-	return operation == AgentOperationInstall || operation == AgentOperationReinstall
+	return operation == AgentOperationInstall || operation == AgentOperationReinstall || operation == AgentOperationUpdate || operation == AgentOperationUninstall
 }
 
 // Status is the lifecycle state of an install Job.
@@ -260,7 +272,7 @@ const defaultPersistenceTimeout = 2 * time.Second
 
 var devinInstalledLine = regexp.MustCompile(`Installed devin v\S+ to [^\r\n]+/devin\.`)
 
-// Job is the tracked state of one install run for a Target.
+// Job is the tracked state of one harness operation for a Target.
 type Job struct {
 	Target              Target `json:"target" enum:"tmux,gh,claude,claude-code,codex,cursor,opencode,opencode-v2,aider,copilot,grok,kimi,pi,amp,auggie,droid,crush,cline,goose,qwen,gemini,continue,devin,kiro,kilocode,vibe,muse,agy,autohand,kimchi,prime-agent,omp,fx,unreal-agent,mimo-code,deepseek-harness,cloudflared" description:"Fixed install target this job ran (or is running) for."`
 	Status              Status `json:"status" enum:"idle,running,installing,verifying,succeeded,failed,unsupported,interrupted" description:"Current lifecycle state of the job."`
@@ -327,8 +339,12 @@ type Service struct {
 	// a real multi-minute wait.
 	installTimeout time.Duration
 	// persistenceTimeout bounds worker-owned transition and terminal writes.
-	persistenceTimeout time.Duration
-	onSucceeded        func(Target)
+	persistenceTimeout  time.Duration
+	onSucceeded         func(Target)
+	latestVersion       func(context.Context, string, string, bool) (string, error)
+	ownsInstallation    func(context.Context, string, string, string, bool) (bool, error)
+	updateAdvisories    map[Target]UpdateAdvisory
+	updateAdvisoryCalls map[Target]*updateAdvisoryCall
 }
 
 // requestPlanner carries one immutable capability snapshot through all recipe
@@ -352,8 +368,8 @@ func (s *Service) newRequestPlanner(ctx context.Context) (requestPlanner, error)
 	return planner, nil
 }
 
-// SetOnSucceeded registers the daemon callback invoked after a verified
-// install. It is called outside the job mutex.
+// SetOnSucceeded registers the daemon callback invoked after a successful
+// harness operation. It is called outside the job mutex.
 func (s *Service) SetOnSucceeded(callback func(Target)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,6 +404,10 @@ func NewWithDeps(executables ports.ExecutableFinder, commands ports.CommandRunne
 		persistenceTimeout:  defaultPersistenceTimeout,
 		stop:                stop,
 		backgroundContext:   backgroundContext,
+		latestVersion:       latestAvailableVersion(commands),
+		ownsInstallation:    packageOwnsBinary(commands),
+		updateAdvisories:    make(map[Target]UpdateAdvisory),
+		updateAdvisoryCalls: make(map[Target]*updateAdvisoryCall),
 	}
 }
 
@@ -411,9 +431,13 @@ func (s *Service) AgentPlans(ctx context.Context) ([]AgentPlan, error) {
 		}
 		recommended := recommendedPlanIndex(plans)
 		plan := plans[recommended]
+		updatePlans := planner.agentMethodPlans(target, AgentOperationUpdate)
+		uninstallPlans := planner.agentMethodPlans(target, AgentOperationUninstall)
 		methods := make([]AgentInstallMethod, 0, len(plans))
 		for index, methodPlan := range plans {
 			reinstallPlan := reinstallByMethod[methodPlan.Method]
+			updatePlan := updatePlans[index]
+			uninstallPlan := uninstallPlans[index]
 			methods = append(methods, AgentInstallMethod{
 				ID: methodPlan.Method, Label: installMethodLabel(methodPlan.Method),
 				Available: !methodPlan.Unsupported, Recommended: index == recommended,
@@ -421,6 +445,10 @@ func (s *Service) AgentPlans(ctx context.Context) ([]AgentPlan, error) {
 				ExpectedDestination: methodPlan.ExpectedDestination,
 				ReinstallAvailable:  !reinstallPlan.Unsupported,
 				ReinstallCommand:    displayCommand(reinstallPlan), ReinstallReason: reinstallPlan.Reason,
+				UpdateAvailable: !updatePlan.Unsupported,
+				UpdateCommand:   displayCommand(updatePlan), UpdateReason: updatePlan.Reason,
+				UninstallAvailable: !uninstallPlan.Unsupported,
+				UninstallCommand:   displayCommand(uninstallPlan), UninstallReason: uninstallPlan.Reason,
 			})
 		}
 		out = append(out, AgentPlan{
@@ -540,8 +568,8 @@ func (s *Service) StartAgent(ctx context.Context, target Target, method string) 
 	return s.StartAgentOperation(ctx, target, method, AgentOperationInstall)
 }
 
-// StartAgentOperation begins a harness install or reinstall using one
-// server-owned method ID and operation.
+// StartAgentOperation begins a harness operation using one server-owned
+// method ID and operation.
 func (s *Service) StartAgentOperation(ctx context.Context, target Target, method string, operation AgentOperation) (Job, error) {
 	if err := ctx.Err(); err != nil {
 		return Job{}, err
@@ -553,34 +581,36 @@ func (s *Service) StartAgentOperation(ctx context.Context, target Target, method
 		return Job{}, fmt.Errorf("systeminstall: unknown harness target %q", target)
 	}
 	var releaseHarness func()
-	if target == TargetDroid || target == TargetFX {
+	if target == TargetDroid || target == TargetFX || operation == AgentOperationUpdate || operation == AgentOperationUninstall {
 		gate := &s.droidGate
 		if target == TargetFX {
 			gate = &s.fxGate
 		}
-		s.mu.Lock()
-		if current, ok := s.jobs[target]; ok && activeStatus(current.Status) {
-			s.mu.Unlock()
-			return Job{}, ErrInstallActive
-		}
-		s.mu.Unlock()
-		if !gate.TryLock() {
-			return Job{}, fmt.Errorf("%w: a %s session is starting", ErrHarnessActive, target)
-		}
-		releaseHarness = gate.Unlock
-		defer func() {
-			if releaseHarness != nil {
-				releaseHarness()
+		if target == TargetDroid || target == TargetFX {
+			s.mu.Lock()
+			if current, ok := s.jobs[target]; ok && activeStatus(current.Status) {
+				s.mu.Unlock()
+				return Job{}, ErrInstallActive
 			}
-		}()
+			s.mu.Unlock()
+			if !gate.TryLock() {
+				return Job{}, fmt.Errorf("%w: a %s session is starting", ErrHarnessActive, target)
+			}
+			releaseHarness = gate.Unlock
+			defer func() {
+				if releaseHarness != nil {
+					releaseHarness()
+				}
+			}()
+		}
 		if s.sessions != nil {
 			sessions, err := s.sessions.ListAllSessions(ctx)
 			if err != nil {
-				return Job{}, fmt.Errorf("systeminstall: list sessions before %s install: %w", target, err)
+				return Job{}, fmt.Errorf("systeminstall: list sessions before harness operation: %w", err)
 			}
 			for _, session := range sessions {
 				if session.Harness == domain.AgentHarness(target) && !session.IsTerminated {
-					return Job{}, fmt.Errorf("%w: end %s session %s before installing or reinstalling %s", ErrHarnessActive, target, session.ID, target)
+					return Job{}, fmt.Errorf("%w: end %s session %s before changing its installation", ErrHarnessActive, target, session.ID)
 				}
 			}
 		}
@@ -651,7 +681,7 @@ func (s *Service) StartAgentOperation(ctx context.Context, target Target, method
 		if workerRelease != nil {
 			defer workerRelease()
 		}
-		s.runAgentInstall(s.backgroundContext, plan, job)
+		s.runAgentOperation(s.backgroundContext, plan, operation, job)
 	}()
 	return initial, nil
 }
@@ -930,7 +960,7 @@ func (s *Service) run(parent context.Context, argv []string, job *Job) {
 	}
 }
 
-func (s *Service) runAgentInstall(parent context.Context, plan Plan, job *Job) {
+func (s *Service) runAgentOperation(parent context.Context, plan Plan, operation AgentOperation, job *Job) {
 	ctx, cancel := context.WithTimeout(parent, s.installTimeout)
 	defer cancel()
 	out := &capturedOutput{max: maxOutputBytes}
@@ -966,11 +996,11 @@ func (s *Service) runAgentInstall(parent context.Context, plan Plan, job *Job) {
 		runErr = s.commands.Run(ctx, plan.Command, out, out)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		s.finishAgentJob(job, StatusFailed, out.String(), fmt.Sprintf("install timed out after %s", s.installTimeout), "")
+		s.finishAgentJob(job, StatusFailed, out.String(), fmt.Sprintf("%s timed out after %s", operation, s.installTimeout), "")
 		return
 	}
 	if ctx.Err() == context.Canceled {
-		s.finishAgentJob(job, StatusInterrupted, out.String(), "daemon shutdown interrupted the install", "")
+		s.finishAgentJob(job, StatusInterrupted, out.String(), fmt.Sprintf("daemon shutdown interrupted %s", operation), "")
 		return
 	}
 	installConfirmed := runErr != nil && devinOutput != nil && devinOutput.Confirmed()
@@ -979,6 +1009,10 @@ func (s *Service) runAgentInstall(parent context.Context, plan Plan, job *Job) {
 		return
 	}
 
+	if operation == AgentOperationUninstall {
+		s.finishAgentJob(job, StatusSucceeded, out.String(), "", "")
+		return
+	}
 	if err := s.transitionAgentJob(job, StatusVerifying, out.String(), "", ""); err != nil {
 		s.finishAgentJob(job, StatusFailed, "", fmt.Sprintf("persist verifying state: %v", err), "")
 		return
@@ -1029,6 +1063,8 @@ func (s *Service) finishAgentJob(job *Job, status Status, output, errorMessage, 
 	}
 	job.FinishedAt = &now
 	job.UpdatedAt = &now
+	delete(s.updateAdvisories, job.Target)
+	delete(s.updateAdvisoryCalls, job.Target)
 	snapshot := *job
 	callback := s.onSucceeded
 	target := job.Target
@@ -1036,7 +1072,7 @@ func (s *Service) finishAgentJob(job *Job, status Status, output, errorMessage, 
 	if err := s.persistJobBestEffort(snapshot); err != nil {
 		s.mu.Lock()
 		job.Status = StatusFailed
-		job.Error = fmt.Sprintf("persist terminal install state: %v", err)
+		job.Error = fmt.Sprintf("persist terminal operation state: %v", err)
 		s.mu.Unlock()
 		return
 	}
@@ -1285,7 +1321,7 @@ func (p requestPlanner) planNPM(target Target, pkg string) Plan {
 			Method: "npm", Reason: "npm was not found on PATH. Install Node.js from https://nodejs.org first, then retry.",
 		}
 	}
-	plan := Plan{Target: target, Command: []string{"npm", "install", "-g", pkg}, Method: "npm"}
+	plan := Plan{Target: target, Command: []string{"npm", "install", "-g", pkg}, Method: "npm", Package: pkg}
 	if IsAgentTarget(target) {
 		if p.capabilities == nil || p.capabilities.NPM.Err != nil {
 			plan.Unsupported = true
@@ -1307,6 +1343,7 @@ func (p requestPlanner) planNPM(target Target, pkg string) Plan {
 			return plan
 		}
 		prefix := npm.GlobalPrefix
+		plan.PackagePrefix = prefix
 		if prefix == "" {
 			plan.Unsupported = true
 			plan.Reason = "npm's global install prefix could not be resolved."
@@ -1451,7 +1488,7 @@ func (p requestPlanner) planHomebrew(target Target, pkg string, cask bool) Plan 
 		command = append(command, "--cask")
 	}
 	command = append(command, pkg)
-	return Plan{Target: target, Command: command, Method: "homebrew"}
+	return Plan{Target: target, Command: command, Method: "homebrew", Package: pkg, PackageCask: cask}
 }
 
 func homebrewPackageInstalled(inventory map[string]bool, pkg string) bool {
@@ -1475,7 +1512,7 @@ func (s *Service) planWinget(target Target, id string) Plan {
 	command := []string{"winget", "install", "-e", "--id", id}
 	if IsAgentTarget(target) {
 		command = append(command, "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
-		return Plan{Target: target, Command: command, Method: "winget"}
+		return Plan{Target: target, Command: command, Method: "winget", Package: id}
 	}
 	return Plan{Target: target, Command: command}
 }
