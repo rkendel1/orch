@@ -1421,6 +1421,9 @@ function ChatWorkspaceContent({
 									assetBaseUrl={assetBaseUrl}
 									remoteHost={Boolean(activeRemoteHostId)}
 									draftScope={draftScope}
+									// A handoff intentionally stops the source controller; that
+									// interval must not read as a crash that settled the turn.
+									controllerStopped={snapshot.controller.state === "stopped" && !controllerTransitioning}
 									hasOlder={hasOlder}
 									loadingOlder={loadingOlder}
 									onLoadOlder={onLoadOlder}
@@ -2037,6 +2040,7 @@ function Timeline({
 	activateBranchError,
 	newWorkDisabled,
 	localEchos = [],
+	controllerStopped = false,
 }: {
 	snapshot: ConversationSnapshot;
 	assetBaseUrl?: string;
@@ -2060,6 +2064,8 @@ function Timeline({
 	activateBranchError?: string;
 	newWorkDisabled?: boolean;
 	localEchos?: ConversationLocalEcho[];
+	/** The controller is gone, so turns still marked running settle here. */
+	controllerStopped?: boolean;
 }) {
 	const translateDraft = useChatDraftTranslation();
 	const uiSessionId = draftScope.sessionId;
@@ -2626,10 +2632,10 @@ function Timeline({
 	const timelineItems = useStableList([...items, ...localItems], itemKey, sameContent);
 	const grouped = useMemo(() => {
 		const hiddenTurns = hiddenTimelineTurnIds(snapshot);
-		return groupByTurn({ ...snapshot, items: timelineItems }).filter(
+		return groupByTurn({ ...snapshot, items: timelineItems }, controllerStopped).filter(
 			(group) => !group.turnId || !hiddenTurns.has(group.turnId),
 		);
-	}, [snapshot, timelineItems]);
+	}, [controllerStopped, snapshot, timelineItems]);
 	const groups = useStableList(grouped, groupKey, sameGroup);
 	const navigableGroups = useMemo(() => groups.filter(groupHasHumanPrompt), [groups]);
 	const previews = useMemo(() => navigableGroups.map(groupPreview), [navigableGroups]);
@@ -3615,7 +3621,7 @@ type TimelineGroup = {
 	anchor: number;
 	items: ConversationItem[];
 	outcome?: {
-		state: "completed" | "recovered" | "interrupted" | "failed";
+		state: "completed" | "recovered" | "interrupted" | "stopped" | "failed";
 		durationMs?: number;
 		error?: string;
 	};
@@ -3732,8 +3738,12 @@ function previewText(value: string, limit: number): string {
  *
  * Items with no turn (an automation relay that arrived between turns) form their
  * own group and keep their sequence position.
+ *
+ * `settleStoppedTurns` closes a turn the daemon still reports as running with an
+ * outcome-unknown marker: its controller is gone, so nothing will ever complete
+ * or interrupt it, and an open group reads as work still in progress.
  */
-function groupByTurn(snapshot: ConversationSnapshot): TimelineGroup[] {
+function groupByTurn(snapshot: ConversationSnapshot, settleStoppedTurns = false): TimelineGroup[] {
 	const byTurn = new Map(snapshot.turns.map((turn) => [turn.id, turn]));
 	const groups: TimelineGroup[] = [];
 	const groupForTurn = new Map<string, TimelineGroup>();
@@ -3785,7 +3795,9 @@ function groupByTurn(snapshot: ConversationSnapshot): TimelineGroup[] {
 		// off, are the useful parts.
 		group.diff = turn.diff;
 		group.plan = turn.plan?.steps.length ? turn.plan : undefined;
-		group.live = turn.state === "running";
+		// A stopped controller cannot be producing live activity: showing the
+		// turn as live spun "Working for…" forever over a dead controller (#6064).
+		group.live = turn.state === "running" && snapshot.controller.state !== "stopped";
 		group.liveStartedAt = turn.startedAt ?? turn.requestedAt;
 		group.blocked = group.items.some(
 			(item) =>
@@ -3801,7 +3813,15 @@ function groupByTurn(snapshot: ConversationSnapshot): TimelineGroup[] {
 					item.status === "running" &&
 					item.detail?.event === "provider.failure",
 			);
-		if (turn.state === "running" || turn.state === "queued" || turn.state === "cancelled") continue;
+		if (turn.state === "running" || turn.state === "queued" || turn.state === "cancelled") {
+			// The daemon still holds an abandoned turn open, so it cannot be rolled
+			// back either — the control would only ever be refused, which is why
+			// this branch stays ahead of the rollbackable assignment below.
+			if (settleStoppedTurns && turn.state === "running") {
+				group.outcome = { state: "stopped", error: "The outcome of this turn is unknown." };
+			}
+			continue;
+		}
 		group.rollbackable = Boolean(turn.providerTurnId);
 		group.outcome = {
 			state: turn.state,

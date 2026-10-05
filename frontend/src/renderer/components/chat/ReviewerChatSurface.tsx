@@ -6,7 +6,22 @@ import { sessionUiKey } from "../../lib/hosts";
 import { useSessionLinkNavigation } from "../../lib/use-session-link-navigation";
 import { ChatWorkspace } from "./ChatWorkspace";
 
-export function ReviewerChatSurface({ reviewId, hostId, hideHeader = false }: { reviewId: string; hostId?: string; hideHeader?: boolean }) {
+export function ReviewerChatSurface({
+	reviewId,
+	hostId,
+	hideHeader = false,
+	onOpenShell,
+	openingShell,
+	shellError,
+}: {
+	reviewId: string;
+	hostId?: string;
+	hideHeader?: boolean;
+	/** Open a shell in the review's worktree — the stopped-banner's recovery lever. */
+	onOpenShell?: () => void;
+	openingShell?: boolean;
+	shellError?: string;
+}) {
 	const { t } = useTranslation();
 	const { snapshot, isLoading, error, hasOlder, isLoadingOlder, loadOlder } = useReviewerConversation(reviewId, hostId);
 	const commands = useReviewerConversationCommands(reviewId, hostId);
@@ -45,6 +60,9 @@ export function ReviewerChatSurface({ reviewId, hostId, hideHeader = false }: { 
 			onDecide={commands.resolve}
 			onResolveInput={commands.resolveInput}
 			onInterrupt={commands.interrupt}
+			onOpenShell={onOpenShell}
+			openingShell={openingShell}
+			shellError={shellError}
 		/>
 	);
 }
