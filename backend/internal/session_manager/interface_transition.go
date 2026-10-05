@@ -1244,10 +1244,15 @@ func (m *Manager) rollbackInterfaceTransition(
 			return
 		}
 	}
+	// A fresh relaunch drops the provider id only in memory. When the epoch never
+	// committed, a Chat source still owns that id durably, so it must resume it:
+	// a fresh start would present an owner the database does not hold.
+	fresh := transition.NativeConversationID == "" &&
+		(modeChanged || transition.SourceMode != domain.SessionModeChat)
 	if err := m.startTransitionTarget(
 		ctx,
 		transition.SessionID,
-		transition.NativeConversationID == "",
+		fresh,
 		false,
 		domain.SessionInterfaceTransitionHistoryStrict,
 	); err != nil {

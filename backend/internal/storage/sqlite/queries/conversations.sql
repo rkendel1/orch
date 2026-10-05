@@ -36,12 +36,33 @@ SELECT * FROM conversations WHERE id = ? LIMIT 1;
 SELECT EXISTS (SELECT 1 FROM conversation_turns WHERE conversation_id = ?);
 
 -- name: ReleaseUntouchedConversationProvider :execrows
+-- A project conversation (orchestrator) has no owning session_id; the session
+-- currently bound to it is the owner for this release.
 UPDATE conversation_branches
 SET provider_conversation_id = '', provider_scope_id = sqlc.arg(provider_scope_id)
 WHERE conversation_branches.session_id = sqlc.arg(session_id) AND parent_branch_id IS NULL
   AND conversation_branches.id = (
       SELECT c.active_branch_id FROM conversations AS c
-      WHERE c.session_id = sqlc.arg(session_id) AND c.current_session_id = sqlc.arg(session_id)
+      WHERE c.current_session_id = sqlc.arg(session_id)
+        AND (c.session_id = sqlc.arg(session_id) OR (c.scope = 'project' AND c.session_id IS NULL))
+        AND c.latest_sequence = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM conversation_turns WHERE conversation_id = c.id
+        )
+  );
+
+-- name: ReplaceUntouchedConversationProvider :execrows
+-- Same proof as ReleaseUntouchedConversationProvider, but rebinds the empty
+-- root to a fresh provider id and keeps its provider scope, which is part of
+-- the persistent provider host's identity.
+UPDATE conversation_branches
+SET provider_conversation_id = sqlc.arg(provider_conversation_id)
+WHERE conversation_branches.session_id = sqlc.arg(session_id) AND parent_branch_id IS NULL
+  AND conversation_branches.provider_conversation_id = sqlc.arg(expected_provider_conversation_id)
+  AND conversation_branches.id = (
+      SELECT c.active_branch_id FROM conversations AS c
+      WHERE c.current_session_id = sqlc.arg(session_id)
+        AND (c.session_id = sqlc.arg(session_id) OR (c.scope = 'project' AND c.session_id IS NULL))
         AND c.latest_sequence = 0
         AND NOT EXISTS (
             SELECT 1 FROM conversation_turns WHERE conversation_id = c.id
